@@ -1,25 +1,73 @@
-from app import app, init_db
+import os
+import sqlite3
+import pytest
+import app as fixer_app
 
-init_db()
-client = app.test_client()
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    test_db = str(tmp_path / "test_fixer.db")
+    monkeypatch.setattr("db.DB_PATH", test_db)
+    monkeypatch.setattr("oauth.DB_PATH", test_db)
+    monkeypatch.setattr("routes.DB_PATH", test_db)
+    monkeypatch.setattr("webhooks.DB_PATH", test_db)
+    monkeypatch.setattr("app.DB_PATH", test_db)
 
-test_cases = [
-    {"id": "1001", "phone": "01066004512"},
-    {"id": "1002", "phone": "00966501234567"},
-    {"id": "1003", "phone": "12345"}
-]
+    application = fixer_app.create_app()
+    application.config["TESTING"] = True
+    with application.test_client() as client:
+        yield client
 
-print("\n🚀 بدء اختبار محرك Fixer محلياً:\n")
-for case in test_cases:
-    res = client.post(
-        "/api/fixer/webhook/order",
-        json=case,
-        headers={"X-Shopify-Shop-Domain": "test-store.myshopify.com"}
+def test_arabic_and_local_phone_e164(client):
+    resp = client.post("/api/fixer/webhook/order", json={
+        "store_id": "arab-shop.myshopify.com",
+        "id": "1001",
+        "shipping_address": {
+            "phone": "٠١٠١٢٣٤٥٦٧٨",
+            "country_code": "EG"
+        }
+    })
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["clean_phone"] == "+201012345678"
+    assert data["validation_status"] == "valid"
+
+def test_merchant_isolation_security(client):
+    resp = client.post("/api/fixer/webhook/order", json={
+        "store_id": "secure-shop.myshopify.com",
+        "id": "1002",
+        "phone": "+201112223334"
+    })
+    fixer_id = resp.get_json()["fixer_id"]
+
+    unauth_resp = client.get("/api/fixer/status/secure-shop.myshopify.com")
+    assert unauth_resp.status_code == 403
+
+    wrong_key_resp = client.get("/api/fixer/status/secure-shop.myshopify.com?fixer_id=fx_wrong")
+    assert wrong_key_resp.status_code == 403
+
+    auth_resp = client.get(
+        "/api/fixer/status/secure-shop.myshopify.com",
+        headers={"X-Fixer-Id": fixer_id}
     )
-    data = res.get_json()
-    print(
-        f"✅ طلب #{data['order_id']} | "
-        f"قبل: {data['raw_phone']} -> بعد: {data['clean_phone']} | "
-        f"الحالة: {data['validation_status']} | "
-        f"الاستهلاك: {data['orders_used']}/{data['free_limit']}"
-    )
+    assert auth_resp.status_code == 200
+    assert auth_resp.get_json()["orders_used"] == 1
+
+def test_free_tier_limit_and_gdpr(client):
+    store = "limit-shop.myshopify.com"
+    for i in range(50):
+        r = client.post("/api/fixer/webhook/order", json={
+            "store_id": store,
+            "id": str(i),
+            "phone": "01099988877"
+        })
+        assert r.status_code == 200
+
+    limit_resp = client.post("/api/fixer/webhook/order", json={
+        "store_id": store,
+        "id": "51",
+        "phone": "01099988877"
+    })
+    assert limit_resp.get_json()["status"] == "upgrade_required"
+
+    redact_resp = client.post("/api/fixer/webhooks/shop_redact", json={"shop_domain": store})
+    assert redact_resp.status_code == 200
