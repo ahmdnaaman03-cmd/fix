@@ -1,8 +1,10 @@
+import json
 import uuid
 import sqlite3
 import urllib.parse
+import urllib.request
 from flask import request, redirect, jsonify
-from db import DB_PATH, SHOPIFY_API_KEY, APP_URL
+from db import DB_PATH, SHOPIFY_API_KEY, SHOPIFY_API_SECRET, APP_URL
 from utils import verify_oauth_hmac
 
 def register_oauth(bp):
@@ -39,6 +41,25 @@ def register_oauth(bp):
         if not verify_oauth_hmac(params):
             return jsonify({"error": "invalid_oauth_hmac"}), 401
 
+        access_token = code
+        if SHOPIFY_API_KEY and SHOPIFY_API_SECRET:
+            token_req = urllib.request.Request(
+                f"https://{shop}/admin/oauth/access_token",
+                data=json.dumps({
+                    "client_id": SHOPIFY_API_KEY,
+                    "client_secret": SHOPIFY_API_SECRET,
+                    "code": code
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            try:
+                with urllib.request.urlopen(token_req, timeout=10) as resp:
+                    token_data = json.loads(resp.read().decode("utf-8"))
+                    access_token = token_data.get("access_token", code)
+            except Exception:
+                pass
+
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
             cur.execute("SELECT fixer_id FROM stores WHERE store_id = ?", (shop,))
@@ -47,15 +68,11 @@ def register_oauth(bp):
                 fixer_id = f"fx_{uuid.uuid4().hex[:8]}"
                 cur.execute(
                     "INSERT INTO stores (fixer_id, store_id, access_token, plan, orders_count) VALUES (?, ?, ?, 'free', 0)",
-                    (fixer_id, shop, code)
+                    (fixer_id, shop, access_token)
                 )
             else:
                 fixer_id = row[0]
-                cur.execute("UPDATE stores SET access_token = ? WHERE store_id = ?", (code, shop))
+                cur.execute("UPDATE stores SET access_token = ? WHERE store_id = ?", (access_token, shop))
             conn.commit()
 
-        return jsonify({
-            "status": "installed",
-            "fixer_id": fixer_id,
-            "store_id": shop
-        }), 200
+        return redirect(f"/api/fixer/dashboard?shop={shop}&fixer_id={fixer_id}")

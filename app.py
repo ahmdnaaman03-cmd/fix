@@ -11,12 +11,14 @@ from utils import verify_shopify_hmac, validate_and_format_phone
 from oauth import register_oauth
 from routes import register_routes
 from webhooks import register_webhooks
+from billing import register_billing
 
 fixer_bp = Blueprint("fixer", __name__, url_prefix="/api/fixer")
 
 register_oauth(fixer_bp)
 register_routes(fixer_bp)
 register_webhooks(fixer_bp)
+register_billing(fixer_bp)
 
 def create_app():
     app = Flask(__name__)

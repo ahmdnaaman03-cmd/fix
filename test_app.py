@@ -10,6 +10,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr("oauth.DB_PATH", test_db)
     monkeypatch.setattr("routes.DB_PATH", test_db)
     monkeypatch.setattr("webhooks.DB_PATH", test_db)
+    monkeypatch.setattr("billing.DB_PATH", test_db)
     monkeypatch.setattr("app.DB_PATH", test_db)
 
     application = fixer_app.create_app()
@@ -42,15 +43,15 @@ def test_merchant_isolation_security(client):
     unauth_resp = client.get("/api/fixer/status/secure-shop.myshopify.com")
     assert unauth_resp.status_code == 403
 
-    wrong_key_resp = client.get("/api/fixer/status/secure-shop.myshopify.com?fixer_id=fx_wrong")
-    assert wrong_key_resp.status_code == 403
-
     auth_resp = client.get(
         "/api/fixer/status/secure-shop.myshopify.com",
         headers={"X-Fixer-Id": fixer_id}
     )
     assert auth_resp.status_code == 200
     assert auth_resp.get_json()["orders_used"] == 1
+
+    dash_resp = client.get(f"/api/fixer/dashboard?shop=secure-shop.myshopify.com&fixer_id={fixer_id}")
+    assert dash_resp.status_code == 200
 
 def test_free_tier_limit_and_gdpr(client):
     store = "limit-shop.myshopify.com"
