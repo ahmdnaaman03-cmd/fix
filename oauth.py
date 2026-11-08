@@ -60,6 +60,27 @@ def register_oauth(bp):
             except Exception:
                 pass
 
+        if access_token and access_token.startswith("shpat_"):
+            webhook_req = urllib.request.Request(
+                f"https://{shop}/admin/api/2026-01/webhooks.json",
+                data=json.dumps({
+                    "webhook": {
+                        "topic": "orders/create",
+                        "address": f"{APP_URL}/api/fixer/webhook/order",
+                        "format": "json"
+                    }
+                }).encode("utf-8"),
+                headers={
+                    "X-Shopify-Access-Token": access_token,
+                    "Content-Type": "application/json"
+                },
+                method="POST"
+            )
+            try:
+                urllib.request.urlopen(webhook_req, timeout=10)
+            except Exception:
+                pass
+
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
             cur.execute("SELECT fixer_id FROM stores WHERE store_id = ?", (shop,))

@@ -1,8 +1,49 @@
+import json
 import uuid
 import sqlite3
+import urllib.request
 from flask import request, jsonify
 from db import DB_PATH, FREE_TIER_LIMIT
 from utils import verify_shopify_hmac, extract_order_phone, validate_and_format_phone
+
+def update_shopify_order(shop, access_token, order_id, data, clean_phone, status):
+    if not access_token or not access_token.startswith("shpat_") or order_id == "0":
+        return "logged_locally"
+
+    existing_tags = [t.strip() for t in (data.get("tags") or "").split(",") if t.strip()]
+    existing_tags = [t for t in existing_tags if not t.startswith("Fixer:")]
+
+    order_payload = {"id": order_id}
+    if status == "valid" and clean_phone:
+        existing_tags.append("Fixer: E.164 Verified")
+        order_payload["phone"] = clean_phone
+        shipping = dict(data.get("shipping_address") or {})
+        if shipping:
+            shipping["phone"] = clean_phone
+            order_payload["shipping_address"] = shipping
+        action_taken = "phone_updated_and_tagged"
+    else:
+        existing_tags.append("Fixer: Invalid Phone")
+        action_taken = "flagged_invalid_phone"
+
+    order_payload["tags"] = ", ".join(existing_tags)
+
+    req = urllib.request.Request(
+        f"https://{shop}/admin/api/2026-01/orders/{order_id}.json",
+        data=json.dumps({"order": order_payload}).encode("utf-8"),
+        headers={
+            "X-Shopify-Access-Token": access_token,
+            "Content-Type": "application/json"
+        },
+        method="PUT"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status in (200, 201):
+                return action_taken
+    except Exception:
+        pass
+    return "logged_locally"
 
 def register_webhooks(bp):
     @bp.route("/webhook/order", methods=["POST"])
@@ -17,17 +58,17 @@ def register_webhooks(bp):
 
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
-            cur.execute("SELECT fixer_id, plan, orders_count FROM stores WHERE store_id = ?", (store_id,))
+            cur.execute("SELECT fixer_id, access_token, plan, orders_count FROM stores WHERE store_id = ?", (store_id,))
             row = cur.fetchone()
             if not row:
                 fixer_id = f"fx_{uuid.uuid4().hex[:8]}"
-                plan, orders_count = "free", 0
+                access_token, plan, orders_count = None, "free", 0
                 cur.execute(
                     "INSERT INTO stores (fixer_id, store_id, plan, orders_count) VALUES (?, ?, ?, ?)",
                     (fixer_id, store_id, plan, orders_count)
                 )
             else:
-                fixer_id, plan, orders_count = row
+                fixer_id, access_token, plan, orders_count = row
 
             if plan == "free" and orders_count >= FREE_TIER_LIMIT:
                 return jsonify({
@@ -46,6 +87,8 @@ def register_webhooks(bp):
             )
             conn.commit()
 
+        shopify_action = update_shopify_order(store_id, access_token, order_id, data, clean_phone, status)
+
         return jsonify({
             "fixer_id": fixer_id,
             "store_id": store_id,
@@ -53,6 +96,7 @@ def register_webhooks(bp):
             "raw_phone": raw_phone,
             "clean_phone": clean_phone,
             "validation_status": status,
+            "shopify_action": shopify_action,
             "orders_used": orders_count + 1,
             "free_limit": FREE_TIER_LIMIT
         }), 200
