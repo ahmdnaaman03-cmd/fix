@@ -16,7 +16,7 @@ PRIVACY_HTML = """
   <h3>Data Retention</h3>
   <p>We do not sell, rent, or share personal data. Logs containing sanitized order IDs and formatting statuses are maintained securely and deleted in compliance with Shopify GDPR requirements.</p>
   <h3>Contact</h3>
-  <p>For any privacy inquiries, please contact: ahmedsaied7@icloud.com</p>
+  <p>For any privacy inquiries, please contact: ahmed@paydod.online</p>
 </body>
 </html>
 """
