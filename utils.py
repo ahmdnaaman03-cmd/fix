@@ -76,12 +76,10 @@ def validate_and_format_phone(raw_phone, default_country_code="+20"):
         m_eg = re.search(r"0?(1[0125]\d{8,})$", digits)
         if m_eg:
             digits = "+20" + m_eg.group(1)
-
     elif default_country_code in ("+966", "+971") and not digits.startswith(default_country_code):
         m_gcc = re.search(r"0?(5\d{8,})$", digits)
         if m_gcc:
             digits = default_country_code + m_gcc.group(1)
-
     elif digits.startswith("0") and not digits.startswith("00"):
         digits = default_country_code + digits[1:]
     elif not digits.startswith("+"):
