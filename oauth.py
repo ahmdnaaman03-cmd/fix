@@ -48,7 +48,8 @@ def register_oauth(bp):
                 data=json.dumps({
                     "client_id": SHOPIFY_API_KEY,
                     "client_secret": SHOPIFY_API_SECRET,
-                    "code": code
+                    "code": code,
+                    "expiring": 1
                 }).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST"
@@ -60,7 +61,7 @@ def register_oauth(bp):
             except Exception:
                 pass
 
-        if access_token and access_token.startswith("shpat_"):
+        if access_token and access_token != code:
             webhook_req = urllib.request.Request(
                 f"https://{shop}/admin/api/2026-01/webhooks.json",
                 data=json.dumps({
