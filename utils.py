@@ -49,10 +49,10 @@ def extract_order_phone(data):
     customer = data.get("customer") or {}
 
     raw_phone = (
-        data.get("phone")
-        or shipping.get("phone")
-        or customer.get("phone")
+        shipping.get("phone")
         or billing.get("phone")
+        or data.get("phone")
+        or customer.get("phone")
         or ""
     )
     country_code_iso = (
@@ -68,16 +68,33 @@ def validate_and_format_phone(raw_phone, default_country_code="+20"):
         return None, "missing_phone"
     normalized_input = str(raw_phone).translate(ARABIC_DIGITS_MAP)
     digits = re.sub(r"[^\d+]", "", normalized_input)
+
     if digits.startswith("00"):
         digits = "+" + digits[2:]
-    elif digits.startswith("01") and len(digits) == 11 and default_country_code == "+20":
+    elif digits.startswith("01") and default_country_code == "+20":
+        digits = "+20" + digits[1:]
+    elif digits.startswith("05") and default_country_code in ("+966", "+971"):
         digits = default_country_code + digits[1:]
-    elif digits.startswith("05") and len(digits) == 10 and default_country_code in ("+966", "+971"):
+    elif digits.startswith("0") and not digits.startswith("00"):
         digits = default_country_code + digits[1:]
-    elif digits.startswith("0") and len(digits) >= 9 and not digits.startswith("00"):
-        digits = default_country_code + digits[1:]
-    elif not digits.startswith("+") and len(digits) >= 10:
-        digits = "+" + digits
+    elif not digits.startswith("+"):
+        if default_country_code == "+20" and digits.startswith("1"):
+            digits = "+20" + digits
+        elif default_country_code in ("+966", "+971") and digits.startswith("5"):
+            digits = default_country_code + digits
+        else:
+            digits = "+" + digits
+
+    if digits.startswith("+20"):
+        if re.match(r"^\+201[0125]\d{8}$", digits):
+            return digits, "valid"
+        return digits, "invalid_format"
+
+    if digits.startswith(("+966", "+971")):
+        if re.match(r"^\+(966|971)5\d{8}$", digits):
+            return digits, "valid"
+        return digits, "invalid_format"
+
     if re.match(r"^\+\d{10,15}$", digits):
         return digits, "valid"
     return digits, "invalid_format"
