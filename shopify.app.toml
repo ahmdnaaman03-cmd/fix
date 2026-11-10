@@ -1,0 +1,30 @@
+client_id = "eaab80121282dc9f5cc31d491bd073f1"
+name = "Fixer Order & Phone Validator"
+application_url = "https://Orderping.pythonanywhere.com/api/fixer/install"
+embedded = true
+
+[access_scopes]
+scopes = "read_orders,write_orders,read_customers"
+
+[auth]
+redirect_urls = [
+  "https://Orderping.pythonanywhere.com/api/fixer/auth/callback"
+]
+
+[webhooks]
+api_version = "2026-10"
+
+  [[webhooks.subscriptions]]
+  uri = "https://Orderping.pythonanywhere.com/api/fixer/webhooks/customers_data_request"
+  compliance_topics = [ "customers/data_request" ]
+
+  [[webhooks.subscriptions]]
+  uri = "https://Orderping.pythonanywhere.com/api/fixer/webhooks/customers_redact"
+  compliance_topics = [ "customers/redact" ]
+
+  [[webhooks.subscriptions]]
+  uri = "https://Orderping.pythonanywhere.com/api/fixer/webhooks/shop_redact"
+  compliance_topics = [ "shop/redact" ]
+
+[pos]
+embedded = false

@@ -25,17 +25,17 @@ COUNTRY_CODES = {
 def verify_shopify_hmac(raw_body, hmac_header):
     if has_app_context() and current_app.config.get("TESTING") and not hmac_header:
         return True
-    secret = os.environ.get("SHOPIFY_API_SECRET") or SHOPIFY_API_SECRET
+    secret = (os.environ.get("SHOPIFY_API_SECRET") or SHOPIFY_API_SECRET or "").strip()
     if not secret or not hmac_header:
         return False
     if isinstance(raw_body, str):
         raw_body = raw_body.encode("utf-8")
     digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
-    computed_hmac = base64.b64encode(digest).decode("utf-8")
-    return hmac.compare_digest(computed_hmac.strip(), hmac_header.strip())
+    computed_hmac = base64.b64encode(digest).decode("utf-8").strip()
+    return hmac.compare_digest(computed_hmac, hmac_header.strip())
 
 def verify_oauth_hmac(params):
-    secret = os.environ.get("SHOPIFY_API_SECRET") or SHOPIFY_API_SECRET
+    secret = (os.environ.get("SHOPIFY_API_SECRET") or SHOPIFY_API_SECRET or "").strip()
     if not secret:
         return False
     hmac_val = params.get("hmac")
