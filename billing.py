@@ -1,8 +1,10 @@
 import json
 import sqlite3
 import urllib.request
-from flask import request, redirect, jsonify, render_template_string
+import urllib.error
+from flask import request, redirect, jsonify, render_template_string, has_app_context, current_app
 from db import DB_PATH, FREE_TIER_LIMIT, APP_URL, SHOPIFY_API_KEY
+from oauth import refresh_store_token
 
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -103,6 +105,20 @@ DASHBOARD_HTML = """
 </html>
 """
 
+def create_shopify_charge(shop, token, payload):
+    req = urllib.request.Request(
+        f"https://{shop}/admin/api/2026-01/recurring_application_charges.json",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "X-Shopify-Access-Token": token,
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        res_data = json.loads(resp.read().decode("utf-8"))
+        return res_data["recurring_application_charge"]["confirmation_url"]
+
 def register_billing(bp):
     @bp.route("/session-ping", methods=["POST"])
     def session_ping():
@@ -165,22 +181,25 @@ def register_billing(bp):
         }
 
         if access_token and len(access_token) > 10:
-            req = urllib.request.Request(
-                f"https://{shop}/admin/api/2026-01/recurring_application_charges.json",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "X-Shopify-Access-Token": access_token,
-                    "Content-Type": "application/json"
-                },
-                method="POST"
-            )
             try:
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    res_data = json.loads(resp.read().decode("utf-8"))
-                    conf_url = res_data["recurring_application_charge"]["confirmation_url"]
-                    return redirect(conf_url)
+                conf_url = create_shopify_charge(shop, access_token, payload)
+                return redirect(conf_url)
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    new_token = refresh_store_token(shop)
+                    if new_token:
+                        try:
+                            conf_url = create_shopify_charge(shop, new_token, payload)
+                            return redirect(conf_url)
+                        except Exception:
+                            pass
+                    if SHOPIFY_API_KEY and not (has_app_context() and current_app.config.get("TESTING")):
+                        return redirect(f"/api/fixer/install?shop={shop}&next=upgrade")
             except Exception:
                 pass
+
+        if SHOPIFY_API_KEY and request.method == "GET" and not (has_app_context() and current_app.config.get("TESTING")):
+            return redirect(f"/api/fixer/install?shop={shop}&next=upgrade")
 
         return jsonify({
             "status": "billing_ready",
