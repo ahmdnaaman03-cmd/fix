@@ -7,7 +7,7 @@ from db import DB_PATH, FREE_TIER_LIMIT
 from utils import verify_shopify_hmac, extract_order_phone, validate_and_format_phone
 
 def update_shopify_order(shop, access_token, order_id, data, clean_phone, status):
-    if not access_token or not access_token.startswith("shpat_") or order_id == "0":
+    if not access_token or not len(access_token) > 10 or order_id == "0":
         return "logged_locally"
 
     existing_tags = [t.strip() for t in (data.get("tags") or "").split(",") if t.strip()]

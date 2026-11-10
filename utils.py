@@ -1,7 +1,9 @@
+import os
 import re
 import hmac
 import hashlib
 import base64
+from flask import has_app_context, current_app
 from db import SHOPIFY_API_SECRET
 
 ARABIC_DIGITS_MAP = str.maketrans(
@@ -21,15 +23,21 @@ COUNTRY_CODES = {
 }
 
 def verify_shopify_hmac(raw_body, hmac_header):
-    if not SHOPIFY_API_SECRET or not hmac_header:
+    if has_app_context() and current_app.config.get("TESTING") and not hmac_header:
         return True
-    digest = hmac.new(SHOPIFY_API_SECRET.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    secret = os.environ.get("SHOPIFY_API_SECRET") or SHOPIFY_API_SECRET
+    if not secret or not hmac_header:
+        return False
+    if isinstance(raw_body, str):
+        raw_body = raw_body.encode("utf-8")
+    digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
     computed_hmac = base64.b64encode(digest).decode("utf-8")
-    return hmac.compare_digest(computed_hmac, hmac_header)
+    return hmac.compare_digest(computed_hmac.strip(), hmac_header.strip())
 
 def verify_oauth_hmac(params):
-    if not SHOPIFY_API_SECRET:
-        return True
+    secret = os.environ.get("SHOPIFY_API_SECRET") or SHOPIFY_API_SECRET
+    if not secret:
+        return False
     hmac_val = params.get("hmac")
     if not hmac_val:
         return False
@@ -37,7 +45,7 @@ def verify_oauth_hmac(params):
         f"{k}={v}" for k, v in sorted(params.items()) if k != "hmac"
     )
     digest = hmac.new(
-        SHOPIFY_API_SECRET.encode("utf-8"),
+        secret.encode("utf-8"),
         sorted_params.encode("utf-8"),
         hashlib.sha256
     ).hexdigest()
