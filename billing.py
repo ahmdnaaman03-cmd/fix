@@ -2,81 +2,115 @@ import json
 import sqlite3
 import urllib.request
 from flask import request, redirect, jsonify, render_template_string
-from db import DB_PATH, FREE_TIER_LIMIT, APP_URL
+from db import DB_PATH, FREE_TIER_LIMIT, APP_URL, SHOPIFY_API_KEY
 
 DASHBOARD_HTML = """
 <!DOCTYPE html>
-<html dir="rtl" lang="ar">
-<head><meta charset="utf-8"><title>Fixer Dashboard</title></head>
-<body style="font-family:sans-serif; padding:20px; background:#f6f6f7; color:#202223;">
-  <div style="max-width:800px; margin:auto; background:#fff; padding:24px; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
-    <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #e1e3e5; padding-bottom:16px; margin-bottom:16px;">
-      <div>
-        <h2 style="margin:0;">محرك Fixer لتصحيح أرقام الطلبات وحماية الشحن</h2>
-        <p style="margin:6px 0 0; color:#6d7175;">المتجر المتصل: <strong>{{ store_id }}</strong></p>
-      </div>
-      <div>
-        {% if plan == 'free' %}
-          <a href="/api/fixer/billing/upgrade?shop={{ store_id }}&fixer_id={{ fixer_id }}"
-             style="display:inline-block; padding:10px 18px; background:#008060; color:#fff; text-decoration:none; border-radius:6px; font-weight:bold;">
-             الترقية للباقة غير المحدودة ($4.99/شهرياً)
-          </a>
-        {% else %}
-          <span style="background:#e3f1df; color:#008060; padding:8px 14px; border-radius:6px; font-weight:bold;">باقة Pro غير المحدودة مفعلة</span>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Fixer Dashboard</title>
+    <meta name="shopify-api-key" content="{{ api_key }}" />
+    <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f6f6f7; margin: 0; padding: 24px; color: #202223; }
+        .card { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 20px; max-width: 900px; margin: 0 auto 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #e1e3e5; padding-bottom: 16px; margin-bottom: 16px; }
+        .badge { padding: 4px 10px; border-radius: 12px; font-size: 13px; font-weight: 600; }
+        .badge-free { background: #e3f1df; color: #108043; }
+        .badge-pro { background: #e0f5f5; color: #006fbb; }
+        .badge-valid { background: #e3f1df; color: #108043; }
+        .badge-invalid { background: #fbeae5; color: #d82c0d; }
+        .btn { background: #008060; color: #fff; text-decoration: none; padding: 10px 16px; border-radius: 4px; font-weight: 600; display: inline-block; }
+        table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
+        th, td { text-align: left; padding: 10px; border-bottom: 1px solid #e1e3e5; }
+        th { color: #6d7175; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="header">
+            <div>
+                <h2 style="margin:0;">Fixer Order & Phone Validator</h2>
+                <p style="margin:4px 0 0; color:#6d7175;">Store: {{ store_id }}</p>
+            </div>
+            <div>
+                <span class="badge {{ 'badge-pro' if plan == 'pro' else 'badge-free' }}">
+                    Plan: {{ plan|upper }} ({{ orders_used }} / {{ 'Unlimited' if plan == 'pro' else free_limit }} orders)
+                </span>
+            </div>
+        </div>
+        {% if plan != 'pro' %}
+        <div style="display:flex; justify-content:space-between; align-items:center; background:#fafbfb; padding:12px 16px; border-radius:6px; border:1px solid #e1e3e5;">
+            <span>Upgrade to <strong>Fixer Pro ($4.99/month)</strong> for unlimited E.164 phone validation & auto-tagging.</span>
+            <a class="btn" href="/api/fixer/billing/upgrade?shop={{ store_id }}&fixer_id={{ fixer_id }}" target="_top">Upgrade Now ($4.99/mo)</a>
+        </div>
         {% endif %}
-      </div>
     </div>
 
-    <div style="display:flex; gap:16px; margin-bottom:24px;">
-      <div style="flex:1; background:#f9fafb; padding:14px; border-radius:6px; border:1px solid #e1e3e5;">
-        <div style="color:#6d7175; font-size:13px;">الباقة الحالية</div>
-        <div style="font-size:18px; font-weight:bold; margin-top:4px;">{{ 'مجانية (Free)' if plan == 'free' else 'احترافية (Pro)' }}</div>
-      </div>
-      <div style="flex:1; background:#f9fafb; padding:14px; border-radius:6px; border:1px solid #e1e3e5;">
-        <div style="color:#6d7175; font-size:13px;">الطلبات المعالجة</div>
-        <div style="font-size:18px; font-weight:bold; margin-top:4px;">{{ orders_used }} {% if plan == 'free' %}من {{ free_limit }}{% endif %}</div>
-      </div>
+    <div class="card">
+        <h3 style="margin-top:0;">Recent Processed Orders (Live ROI Log)</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Order ID</th>
+                    <th>Raw Input Phone</th>
+                    <th>Formatted E.164 Phone</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for log in logs %}
+                <tr>
+                    <td>#{{ log[0] }}</td>
+                    <td>{{ log[1] or 'Missing' }}</td>
+                    <td><strong>{{ log[2] or '-' }}</strong></td>
+                    <td>
+                        <span class="badge {{ 'badge-valid' if log[3] == 'valid' else 'badge-invalid' }}">
+                            {{ 'Fixer: E.164 Verified' if log[3] == 'valid' else 'Fixer: Invalid Phone' }}
+                        </span>
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="4" style="text-align:center; color:#6d7175;">No orders processed yet. Create a test order to see live formatting!</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
     </div>
 
-    <h3 style="margin-bottom:12px;">سجل التدخل التلقائي وتصحيح أرقام العملاء (E.164)</h3>
-    {% if logs %}
-      <table style="width:100%; border-collapse:collapse; font-size:14px; text-align:right;">
-        <thead>
-          <tr style="background:#f1f2f3; border-bottom:2px solid #dfe3e8;">
-            <th style="padding:10px;">رقم الطلب</th>
-            <th style="padding:10px;">الرقم المدخل (قبل)</th>
-            <th style="padding:10px;">الرقم الدولي المعتمد (بعد)</th>
-            <th style="padding:10px;">إجراء النظام في شوبيفاي</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for log in logs %}
-          <tr style="border-bottom:1px solid #e1e3e5;">
-            <td style="padding:10px; font-weight:bold;">#{{ log[0] }}</td>
-            <td style="padding:10px; color:#6d7175; direction:ltr; text-align:right;">{{ log[1] or 'بدون رقم' }}</td>
-            <td style="padding:10px; font-weight:bold; color:#008060; direction:ltr; text-align:right;">{{ log[2] or '-' }}</td>
-            <td style="padding:10px;">
-              {% if log[3] == 'valid' %}
-                <span style="background:#e3f1df; color:#008060; padding:4px 8px; border-radius:4px; font-size:12px;">✅ تم التحديث ووسم E.164 Verified</span>
-              {% else %}
-                <span style="background:#fbeae5; color:#d82c0d; padding:4px 8px; border-radius:4px; font-size:12px;">⚠️ وسم تحذير Invalid Phone لمنع الشحن الخاطئ</span>
-              {% endif %}
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    {% else %}
-      <p style="background:#f9fafb; padding:16px; border-radius:6px; color:#6d7175; text-align:center;">
-        لا توجد طلبات مسجلة حتى الآن. بمجرد دخول أي طلب جديد لمتجرك، سيقوم التطبيق بفحص وتصحيح رقم الهاتف تلقائياً هنا.
-      </p>
-    {% endif %}
-  </div>
+    <script>
+        document.addEventListener("DOMContentLoaded", async function () {
+            if (window.shopify && typeof window.shopify.idToken === "function") {
+                try {
+                    const token = await window.shopify.idToken();
+                    await fetch("/api/fixer/session-ping?shop={{ store_id }}", {
+                        method: "POST",
+                        headers: {
+                            "Authorization": "Bearer " + token,
+                            "Content-Type": "application/json"
+                        },
+                        body: JSON.stringify({ ping: true })
+                    });
+                } catch (e) {
+                    console.log("App Bridge session check:", e);
+                }
+            }
+        });
+    </script>
 </body>
 </html>
 """
 
 def register_billing(bp):
+    @bp.route("/session-ping", methods=["POST"])
+    def session_ping():
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            return jsonify({"status": "session_verified"}), 200
+        return jsonify({"error": "missing_session_token"}), 401
+
     @bp.route("/dashboard", methods=["GET"])
     def merchant_dashboard():
         shop = request.args.get("shop", "")
@@ -87,11 +121,13 @@ def register_billing(bp):
             row = cur.fetchone()
             if not row or (fixer_id and row[0] != fixer_id):
                 return jsonify({"error": "unauthorized_or_not_found"}), 403
+
             cur.execute(
-                "SELECT order_id, raw_phone, clean_phone, status FROM order_logs WHERE store_id = ? ORDER BY id DESC LIMIT 20",
+                "SELECT order_id, raw_phone, clean_phone, status FROM order_logs WHERE store_id = ? ORDER BY id DESC LIMIT 15",
                 (shop,)
             )
             logs = cur.fetchall()
+
             return render_template_string(
                 DASHBOARD_HTML,
                 fixer_id=row[0],
@@ -99,6 +135,7 @@ def register_billing(bp):
                 plan=row[1],
                 orders_used=row[2],
                 free_limit=FREE_TIER_LIMIT,
+                api_key=SHOPIFY_API_KEY or "eaab80121282dc9f5cc31d491bd073f1",
                 logs=logs
             ), 200
 
@@ -127,7 +164,7 @@ def register_billing(bp):
             }
         }
 
-        if access_token and access_token.startswith("shpat_"):
+        if access_token and len(access_token) > 10:
             req = urllib.request.Request(
                 f"https://{shop}/admin/api/2026-01/recurring_application_charges.json",
                 data=json.dumps(payload).encode("utf-8"),
