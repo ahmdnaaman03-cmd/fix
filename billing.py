@@ -105,10 +105,44 @@ DASHBOARD_HTML = """
 </html>
 """
 
-def create_shopify_charge(shop, token, payload):
+def create_shopify_charge(shop, token, return_url):
+    graphql_payload = {
+        "query": """
+        mutation AppSubscriptionCreate($name: String!, $lineItems: [AppSubscriptionLineItemInput!]!, $returnUrl: URL!, $test: Boolean) {
+          appSubscriptionCreate(name: $name, returnUrl: $returnUrl, test: $test, lineItems: $lineItems) {
+            userErrors {
+              field
+              message
+            }
+            confirmationUrl
+            appSubscription {
+              id
+            }
+          }
+        }
+        """,
+        "variables": {
+            "name": "Fixer Pro Plan",
+            "returnUrl": return_url,
+            "test": True,
+            "lineItems": [
+                {
+                    "plan": {
+                        "appRecurringPricingDetails": {
+                            "price": {
+                                "amount": 4.99,
+                                "currencyCode": "USD"
+                            },
+                            "interval": "EVERY_30_DAYS"
+                        }
+                    }
+                }
+            ]
+        }
+    }
     req = urllib.request.Request(
-        f"https://{shop}/admin/api/2026-01/recurring_application_charges.json",
-        data=json.dumps(payload).encode("utf-8"),
+        f"https://{shop}/admin/api/2026-01/graphql.json",
+        data=json.dumps(graphql_payload).encode("utf-8"),
         headers={
             "X-Shopify-Access-Token": token,
             "Content-Type": "application/json"
@@ -117,7 +151,10 @@ def create_shopify_charge(shop, token, payload):
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         res_data = json.loads(resp.read().decode("utf-8"))
-        return res_data["recurring_application_charge"]["confirmation_url"]
+        sub_data = (res_data.get("data") or {}).get("appSubscriptionCreate") or {}
+        if sub_data.get("confirmationUrl"):
+            return sub_data["confirmationUrl"]
+        raise ValueError("Missing confirmationUrl from GraphQL appSubscriptionCreate")
 
 def register_billing(bp):
     @bp.route("/session-ping", methods=["POST"])
@@ -171,25 +208,17 @@ def register_billing(bp):
             access_token = row[1]
 
         return_url = f"{APP_URL}/api/fixer/billing/confirm?shop={shop}&fixer_id={fixer_id}"
-        payload = {
-            "recurring_application_charge": {
-                "name": "Fixer Pro Plan",
-                "price": 4.99,
-                "return_url": return_url,
-                "test": True
-            }
-        }
 
         if access_token and len(access_token) > 10:
             try:
-                conf_url = create_shopify_charge(shop, access_token, payload)
+                conf_url = create_shopify_charge(shop, access_token, return_url)
                 return redirect(conf_url)
             except urllib.error.HTTPError as e:
                 if e.code in (401, 403):
                     new_token = refresh_store_token(shop)
                     if new_token:
                         try:
-                            conf_url = create_shopify_charge(shop, new_token, payload)
+                            conf_url = create_shopify_charge(shop, new_token, return_url)
                             return redirect(conf_url)
                         except Exception:
                             pass

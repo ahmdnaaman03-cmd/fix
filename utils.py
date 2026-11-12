@@ -81,11 +81,11 @@ def validate_and_format_phone(raw_phone, default_country_code="+20"):
         digits = "+" + digits[2:]
 
     if default_country_code == "+20" and not digits.startswith("+20"):
-        m_eg = re.search(r"0?(1[0125]\d{8,})$", digits)
+        m_eg = re.search(r"^(?:\+\d{1,3}|0)?(1[0125]\d{8})$", digits)
         if m_eg:
             digits = "+20" + m_eg.group(1)
     elif default_country_code in ("+966", "+971") and not digits.startswith(default_country_code):
-        m_gcc = re.search(r"0?(5\d{8,})$", digits)
+        m_gcc = re.search(r"^(?:\+\d{1,3}|0)?(5\d{8})$", digits)
         if m_gcc:
             digits = default_country_code + m_gcc.group(1)
     elif digits.startswith("0") and not digits.startswith("00"):
@@ -96,13 +96,13 @@ def validate_and_format_phone(raw_phone, default_country_code="+20"):
     if default_country_code == "+20" or digits.startswith("+20"):
         if re.match(r"^\+201[0125]\d{8}$", digits):
             return digits, "valid"
-        return digits, "invalid_format"
+        return None, "invalid_format"
 
     if default_country_code in ("+966", "+971") or digits.startswith(("+966", "+971")):
         if re.match(r"^\+(966|971)5\d{8}$", digits):
             return digits, "valid"
-        return digits, "invalid_format"
+        return None, "invalid_format"
 
     if re.match(r"^\+\d{10,15}$", digits):
         return digits, "valid"
-    return digits, "invalid_format"
+    return None, "invalid_format"

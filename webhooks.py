@@ -2,9 +2,45 @@ import json
 import uuid
 import sqlite3
 import urllib.request
+import urllib.error
 from flask import request, jsonify
 from db import DB_PATH, FREE_TIER_LIMIT
 from utils import verify_shopify_hmac, extract_order_phone, validate_and_format_phone
+from oauth import refresh_store_token
+
+def execute_order_update_graphql(shop, access_token, order_input):
+    graphql_payload = {
+        "query": """
+        mutation orderUpdate($input: OrderInput!) {
+          orderUpdate(input: $input) {
+            order {
+              id
+              tags
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """,
+        "variables": {
+            "input": order_input
+        }
+    }
+    req = urllib.request.Request(
+        f"https://{shop}/admin/api/2026-01/graphql.json",
+        data=json.dumps(graphql_payload).encode("utf-8"),
+        headers={
+            "X-Shopify-Access-Token": access_token,
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        res_body = json.loads(resp.read().decode("utf-8"))
+        user_errors = ((res_body.get("data") or {}).get("orderUpdate") or {}).get("userErrors") or []
+        return resp.status in (200, 201) and not user_errors
 
 def update_shopify_order(shop, access_token, order_id, data, clean_phone, status):
     if not access_token or not len(access_token) > 10 or order_id == "0":
@@ -13,34 +49,48 @@ def update_shopify_order(shop, access_token, order_id, data, clean_phone, status
     existing_tags = [t.strip() for t in (data.get("tags") or "").split(",") if t.strip()]
     existing_tags = [t for t in existing_tags if not t.startswith("Fixer:")]
 
-    order_payload = {"id": order_id}
+    order_gid = order_id if str(order_id).startswith("gid://") else f"gid://shopify/Order/{order_id}"
+    order_input = {"id": order_gid}
+
     if status == "valid" and clean_phone:
         existing_tags.append("Fixer: E.164 Verified")
-        order_payload["phone"] = clean_phone
         shipping = dict(data.get("shipping_address") or {})
         if shipping:
-            shipping["phone"] = clean_phone
-            order_payload["shipping_address"] = shipping
+            addr_input = {"phone": clean_phone}
+            field_map = {
+                "first_name": "firstName",
+                "last_name": "lastName",
+                "address1": "address1",
+                "address2": "address2",
+                "city": "city",
+                "province_code": "provinceCode",
+                "country_code": "countryCode",
+                "zip": "zip",
+                "company": "company"
+            }
+            for k_snake, k_camel in field_map.items():
+                if shipping.get(k_snake):
+                    addr_input[k_camel] = shipping[k_snake]
+            order_input["shippingAddress"] = addr_input
         action_taken = "phone_updated_and_tagged"
     else:
         existing_tags.append("Fixer: Invalid Phone")
         action_taken = "flagged_invalid_phone"
 
-    order_payload["tags"] = ", ".join(existing_tags)
+    order_input["tags"] = existing_tags
 
-    req = urllib.request.Request(
-        f"https://{shop}/admin/api/2026-01/orders/{order_id}.json",
-        data=json.dumps({"order": order_payload}).encode("utf-8"),
-        headers={
-            "X-Shopify-Access-Token": access_token,
-            "Content-Type": "application/json"
-        },
-        method="PUT"
-    )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status in (200, 201):
-                return action_taken
+        if execute_order_update_graphql(shop, access_token, order_input):
+            return action_taken
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            new_token = refresh_store_token(shop)
+            if new_token:
+                try:
+                    if execute_order_update_graphql(shop, new_token, order_input):
+                        return action_taken
+                except Exception:
+                    pass
     except Exception:
         pass
     return "logged_locally"

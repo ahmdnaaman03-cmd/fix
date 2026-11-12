@@ -46,6 +46,43 @@ def refresh_store_token(shop):
         pass
     return None
 
+def register_order_webhook_graphql(shop, access_token):
+    graphql_payload = {
+        "query": """
+        mutation webhookSubscriptionCreate($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
+          webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
+            webhookSubscription {
+              id
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """,
+        "variables": {
+            "topic": "ORDERS_CREATE",
+            "webhookSubscription": {
+                "callbackUrl": f"{APP_URL}/api/fixer/webhook/order",
+                "format": "JSON"
+            }
+        }
+    }
+    req = urllib.request.Request(
+        f"https://{shop}/admin/api/2026-01/graphql.json",
+        data=json.dumps(graphql_payload).encode("utf-8"),
+        headers={
+            "X-Shopify-Access-Token": access_token,
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+
 def register_oauth(bp):
     @bp.route("/install", methods=["GET"])
     @bp.route("/auth", methods=["GET"])
@@ -106,25 +143,7 @@ def register_oauth(bp):
                 pass
 
         if access_token and access_token != code:
-            webhook_req = urllib.request.Request(
-                f"https://{shop}/admin/api/2026-01/webhooks.json",
-                data=json.dumps({
-                    "webhook": {
-                        "topic": "orders/create",
-                        "address": f"{APP_URL}/api/fixer/webhook/order",
-                        "format": "json"
-                    }
-                }).encode("utf-8"),
-                headers={
-                    "X-Shopify-Access-Token": access_token,
-                    "Content-Type": "application/json"
-                },
-                method="POST"
-            )
-            try:
-                urllib.request.urlopen(webhook_req, timeout=10)
-            except Exception:
-                pass
+            register_order_webhook_graphql(shop, access_token)
 
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()

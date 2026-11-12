@@ -32,6 +32,20 @@ def test_arabic_and_local_phone_e164(client):
     assert data["clean_phone"] == "+201012345678"
     assert data["validation_status"] == "valid"
 
+def test_ambiguous_phone_flagged_not_rewritten(client):
+    resp = client.post("/api/fixer/webhook/order", json={
+        "store_id": "arab-shop.myshopify.com",
+        "id": "1005",
+        "shipping_address": {
+            "phone": "0501234567",
+            "country_code": "EG"
+        }
+    })
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["clean_phone"] is None
+    assert data["validation_status"] == "invalid_format"
+
 def test_merchant_isolation_security(client):
     resp = client.post("/api/fixer/webhook/order", json={
         "store_id": "secure-shop.myshopify.com",
