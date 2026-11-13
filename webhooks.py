@@ -42,7 +42,7 @@ def execute_order_update_graphql(shop, access_token, order_input):
         user_errors = ((res_body.get("data") or {}).get("orderUpdate") or {}).get("userErrors") or []
         return resp.status in (200, 201) and not user_errors
 
-def update_shopify_order(shop, access_token, order_id, data, clean_phone, status):
+def update_shopify_order(shop, access_token, order_id, data, clean_phone, status, is_duplicate=False):
     if not access_token or not len(access_token) > 10 or order_id == "0":
         return "logged_locally"
 
@@ -54,6 +54,8 @@ def update_shopify_order(shop, access_token, order_id, data, clean_phone, status
 
     if status == "valid" and clean_phone:
         existing_tags.append("Fixer: E.164 Verified")
+        if is_duplicate:
+            existing_tags.append("Fixer: Duplicate Order")
         shipping = dict(data.get("shipping_address") or {})
         if shipping:
             addr_input = {"phone": clean_phone}
@@ -75,6 +77,8 @@ def update_shopify_order(shop, access_token, order_id, data, clean_phone, status
         action_taken = "phone_updated_and_tagged"
     else:
         existing_tags.append("Fixer: Invalid Phone")
+        if is_duplicate:
+            existing_tags.append("Fixer: Duplicate Order")
         action_taken = "flagged_invalid_phone"
 
     order_input["tags"] = existing_tags
@@ -120,6 +124,27 @@ def register_webhooks(bp):
             else:
                 fixer_id, access_token, plan, orders_count = row
 
+            if order_id != "0":
+                cur.execute(
+                    "SELECT raw_phone, clean_phone, status FROM order_logs WHERE store_id = ? AND order_id = ? LIMIT 1",
+                    (store_id, order_id)
+                )
+                existing_log = cur.fetchone()
+                if existing_log:
+                    saved_status = "valid" if existing_log[2] == "valid_duplicate" else existing_log[2]
+                    return jsonify({
+                        "fixer_id": fixer_id,
+                        "store_id": store_id,
+                        "order_id": order_id,
+                        "raw_phone": existing_log[0],
+                        "clean_phone": existing_log[1],
+                        "validation_status": saved_status,
+                        "is_duplicate": existing_log[2] == "valid_duplicate",
+                        "shopify_action": "idempotent_skip",
+                        "orders_used": orders_count,
+                        "free_limit": FREE_TIER_LIMIT
+                    }), 200
+
             if plan == "free" and orders_count >= FREE_TIER_LIMIT:
                 return jsonify({
                     "fixer_id": fixer_id,
@@ -130,14 +155,27 @@ def register_webhooks(bp):
                 }), 200
 
             clean_phone, status = validate_and_format_phone(raw_phone, default_country_code=dial_code)
+
+            is_duplicate = False
+            if clean_phone:
+                cur.execute(
+                    "SELECT 1 FROM order_logs WHERE store_id = ? AND clean_phone = ? LIMIT 1",
+                    (store_id, clean_phone)
+                )
+                if cur.fetchone():
+                    is_duplicate = True
+
+            db_status = "valid_duplicate" if (status == "valid" and is_duplicate) else status
             cur.execute("UPDATE stores SET orders_count = orders_count + 1 WHERE fixer_id = ?", (fixer_id,))
             cur.execute(
                 "INSERT INTO order_logs (fixer_id, store_id, order_id, raw_phone, clean_phone, status) VALUES (?, ?, ?, ?, ?, ?)",
-                (fixer_id, store_id, order_id, raw_phone, clean_phone, status)
+                (fixer_id, store_id, order_id, raw_phone, clean_phone, db_status)
             )
             conn.commit()
 
-        shopify_action = update_shopify_order(store_id, access_token, order_id, data, clean_phone, status)
+        shopify_action = update_shopify_order(
+            store_id, access_token, order_id, data, clean_phone, status, is_duplicate=is_duplicate
+        )
 
         return jsonify({
             "fixer_id": fixer_id,
@@ -146,6 +184,7 @@ def register_webhooks(bp):
             "raw_phone": raw_phone,
             "clean_phone": clean_phone,
             "validation_status": status,
+            "is_duplicate": is_duplicate,
             "shopify_action": shopify_action,
             "orders_used": orders_count + 1,
             "free_limit": FREE_TIER_LIMIT

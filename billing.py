@@ -18,10 +18,15 @@ DASHBOARD_HTML = """
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f6f6f7; margin: 0; padding: 24px; color: #202223; }
         .card { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 20px; max-width: 900px; margin: 0 auto 20px; }
         .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #e1e3e5; padding-bottom: 16px; margin-bottom: 16px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
+        .stat-box { background: #fafbfb; border: 1px solid #e1e3e5; border-radius: 6px; padding: 12px; text-align: center; }
+        .stat-val { font-size: 20px; font-weight: 700; color: #202223; }
+        .stat-lbl { font-size: 12px; color: #6d7175; margin-top: 4px; }
         .badge { padding: 4px 10px; border-radius: 12px; font-size: 13px; font-weight: 600; }
         .badge-free { background: #e3f1df; color: #108043; }
         .badge-pro { background: #e0f5f5; color: #006fbb; }
         .badge-valid { background: #e3f1df; color: #108043; }
+        .badge-dup { background: #fff5ea; color: #b98900; }
         .badge-invalid { background: #fbeae5; color: #d82c0d; }
         .btn { background: #008060; color: #fff; text-decoration: none; padding: 10px 16px; border-radius: 4px; font-weight: 600; display: inline-block; }
         table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
@@ -42,9 +47,25 @@ DASHBOARD_HTML = """
                 </span>
             </div>
         </div>
+
+        <div class="stats-grid">
+            <div class="stat-box">
+                <div class="stat-val" style="color:#108043;">{{ valid_count }}</div>
+                <div class="stat-lbl">Verified E.164 Phones</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-val" style="color:#d82c0d;">{{ risked_count }}</div>
+                <div class="stat-lbl">Invalid / Duplicate Caught</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-val" style="color:#006fbb;">${{ "%.2f"|format(risked_count * 3.5) }}</div>
+                <div class="stat-lbl">Est. Saved Return Shipping</div>
+            </div>
+        </div>
+
         {% if plan != 'pro' %}
         <div style="display:flex; justify-content:space-between; align-items:center; background:#fafbfb; padding:12px 16px; border-radius:6px; border:1px solid #e1e3e5;">
-            <span>Upgrade to <strong>Fixer Pro ($4.99/month)</strong> for unlimited E.164 phone validation & auto-tagging.</span>
+            <span>Upgrade to <strong>Fixer Pro ($4.99/month)</strong> for unlimited E.164 phone validation, duplicate detection & auto-tagging.</span>
             <a class="btn" href="/api/fixer/billing/upgrade?shop={{ store_id }}&fixer_id={{ fixer_id }}" target="_top">Upgrade Now ($4.99/mo)</a>
         </div>
         {% endif %}
@@ -68,9 +89,13 @@ DASHBOARD_HTML = """
                     <td>{{ log[1] or 'Missing' }}</td>
                     <td><strong>{{ log[2] or '-' }}</strong></td>
                     <td>
-                        <span class="badge {{ 'badge-valid' if log[3] == 'valid' else 'badge-invalid' }}">
-                            {{ 'Fixer: E.164 Verified' if log[3] == 'valid' else 'Fixer: Invalid Phone' }}
-                        </span>
+                        {% if log[3] == 'valid' %}
+                        <span class="badge badge-valid">Fixer: E.164 Verified</span>
+                        {% elif log[3] == 'valid_duplicate' %}
+                        <span class="badge badge-dup">Fixer: Duplicate Order</span>
+                        {% else %}
+                        <span class="badge badge-invalid">Fixer: Invalid Phone</span>
+                        {% endif %}
                     </td>
                 </tr>
                 {% else %}
@@ -181,6 +206,12 @@ def register_billing(bp):
             )
             logs = cur.fetchall()
 
+            cur.execute("SELECT COUNT(*) FROM order_logs WHERE store_id = ? AND status IN ('valid', 'valid_duplicate')", (shop,))
+            valid_count = (cur.fetchone() or [0])[0]
+
+            cur.execute("SELECT COUNT(*) FROM order_logs WHERE store_id = ? AND status != 'valid'", (shop,))
+            risked_count = (cur.fetchone() or [0])[0]
+
             return render_template_string(
                 DASHBOARD_HTML,
                 fixer_id=row[0],
@@ -188,6 +219,8 @@ def register_billing(bp):
                 plan=row[1],
                 orders_used=row[2],
                 free_limit=FREE_TIER_LIMIT,
+                valid_count=valid_count,
+                risked_count=risked_count,
                 api_key=SHOPIFY_API_KEY or "eaab80121282dc9f5cc31d491bd073f1",
                 logs=logs
             ), 200
