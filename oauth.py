@@ -3,6 +3,7 @@ import uuid
 import sqlite3
 import urllib.parse
 import urllib.request
+import urllib.error
 from flask import request, redirect, jsonify
 from db import DB_PATH, SHOPIFY_API_KEY, SHOPIFY_API_SECRET, APP_URL
 from utils import verify_oauth_hmac
@@ -46,7 +47,93 @@ def refresh_store_token(shop):
         pass
     return None
 
-def register_order_webhook_graphql(shop, access_token):
+def fetch_active_subscriptions_graphql(shop, access_token):
+    graphql_payload = {
+        "query": """
+        query {
+          currentAppInstallation {
+            activeSubscriptions {
+              id
+              name
+              status
+              test
+            }
+          }
+        }
+        """
+    }
+    req = urllib.request.Request(
+        f"https://{shop}/admin/api/2026-01/graphql.json",
+        data=json.dumps(graphql_payload).encode("utf-8"),
+        headers={
+            "X-Shopify-Access-Token": access_token,
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        res_data = json.loads(resp.read().decode("utf-8"))
+        installation = (res_data.get("data") or {}).get("currentAppInstallation") or {}
+        return installation.get("activeSubscriptions") or []
+
+def sync_store_subscription(shop, access_token=None, from_billing_confirm=False):
+    if not access_token:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute("SELECT access_token FROM stores WHERE store_id = ?", (shop,)).fetchone()
+            access_token = row[0] if row else None
+
+    if not access_token or len(access_token) <= 10:
+        return None, None
+
+    subs = None
+    try:
+        subs = fetch_active_subscriptions_graphql(shop, access_token)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            new_token = refresh_store_token(shop)
+            if new_token:
+                try:
+                    subs = fetch_active_subscriptions_graphql(shop, new_token)
+                except Exception:
+                    return None, None
+        else:
+            return None, None
+    except Exception:
+        return None, None
+
+    active_sub = next((s for s in (subs or []) if (s.get("status") or "").upper() == "ACTIVE"), None)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT plan, subscription_status FROM stores WHERE store_id = ?", (shop,))
+        row = cur.fetchone()
+        if not row:
+            return None, None
+        current_plan, current_sub_status = row[0] or "free", row[1] or "none"
+
+        if active_sub:
+            new_plan = "pro"
+            new_status = "active"
+            cur.execute(
+                "UPDATE stores SET plan = ?, subscription_status = ?, subscription_id = ? WHERE store_id = ?",
+                (new_plan, new_status, active_sub.get("id"), shop)
+            )
+        else:
+            new_plan = "free"
+            if from_billing_confirm or current_sub_status == "pending":
+                new_status = "declined"
+            elif current_plan == "pro" or current_sub_status in ("active", "cancelled"):
+                new_status = "cancelled"
+            else:
+                new_status = current_sub_status
+            cur.execute(
+                "UPDATE stores SET plan = ?, subscription_status = ?, subscription_id = NULL WHERE store_id = ?",
+                (new_plan, new_status, shop)
+            )
+        conn.commit()
+        return new_plan, new_status
+
+def register_webhook_graphql(shop, access_token, topic, callback_path):
     graphql_payload = {
         "query": """
         mutation webhookSubscriptionCreate($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
@@ -62,9 +149,9 @@ def register_order_webhook_graphql(shop, access_token):
         }
         """,
         "variables": {
-            "topic": "ORDERS_CREATE",
+            "topic": topic,
             "webhookSubscription": {
-                "callbackUrl": f"{APP_URL}/api/fixer/webhook/order",
+                "callbackUrl": f"{APP_URL}{callback_path}",
                 "format": "JSON"
             }
         }
@@ -142,9 +229,6 @@ def register_oauth(bp):
             except Exception:
                 pass
 
-        if access_token and access_token != code:
-            register_order_webhook_graphql(shop, access_token)
-
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
             cur.execute("SELECT fixer_id FROM stores WHERE store_id = ?", (shop,))
@@ -152,7 +236,7 @@ def register_oauth(bp):
             if not row:
                 fixer_id = f"fx_{uuid.uuid4().hex[:8]}"
                 cur.execute(
-                    "INSERT INTO stores (fixer_id, store_id, access_token, refresh_token, plan, orders_count) VALUES (?, ?, ?, ?, 'free', 0)",
+                    "INSERT INTO stores (fixer_id, store_id, access_token, refresh_token, plan, subscription_status, orders_count) VALUES (?, ?, ?, ?, 'free', 'none', 0)",
                     (fixer_id, shop, access_token, refresh_token)
                 )
             else:
@@ -162,6 +246,11 @@ def register_oauth(bp):
                     (access_token, refresh_token, shop)
                 )
             conn.commit()
+
+        if access_token and access_token != code:
+            register_webhook_graphql(shop, access_token, "ORDERS_CREATE", "/api/fixer/webhook/order")
+            register_webhook_graphql(shop, access_token, "APP_UNINSTALLED", "/api/fixer/webhooks/app_uninstalled")
+            sync_store_subscription(shop, access_token)
 
         if state.startswith("upgrade_"):
             return redirect(f"/api/fixer/billing/upgrade?shop={shop}&fixer_id={fixer_id}")

@@ -1,10 +1,11 @@
+import os
 import json
 import sqlite3
 import urllib.request
 import urllib.error
 from flask import request, redirect, jsonify, render_template_string, has_app_context, current_app
 from db import DB_PATH, FREE_TIER_LIMIT, APP_URL, SHOPIFY_API_KEY
-from oauth import refresh_store_token
+from oauth import refresh_store_token, sync_store_subscription
 
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -18,6 +19,10 @@ DASHBOARD_HTML = """
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f6f6f7; margin: 0; padding: 24px; color: #202223; }
         .card { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 20px; max-width: 900px; margin: 0 auto 20px; }
         .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #e1e3e5; padding-bottom: 16px; margin-bottom: 16px; }
+        .banner { padding: 12px 16px; border-radius: 6px; margin-bottom: 16px; font-size: 14px; line-height: 1.45; }
+        .banner-warn { background: #fff5ea; border: 1px solid #e1b878; color: #594400; }
+        .banner-info { background: #fef3f2; border: 1px solid #f4c7c3; color: #7a271a; }
+        .banner-success { background: #e3f1df; border: 1px solid #95c9b4; color: #0c5132; }
         .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
         .stat-box { background: #fafbfb; border: 1px solid #e1e3e5; border-radius: 6px; padding: 12px; text-align: center; }
         .stat-val { font-size: 20px; font-weight: 700; color: #202223; }
@@ -28,7 +33,7 @@ DASHBOARD_HTML = """
         .badge-valid { background: #e3f1df; color: #108043; }
         .badge-dup { background: #fff5ea; color: #b98900; }
         .badge-invalid { background: #fbeae5; color: #d82c0d; }
-        .btn { background: #008060; color: #fff; text-decoration: none; padding: 10px 16px; border-radius: 4px; font-weight: 600; display: inline-block; }
+        .btn { background: #008060; color: #fff; text-decoration: none; padding: 10px 16px; border-radius: 4px; font-weight: 600; display: inline-block; white-space: nowrap; }
         table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
         th, td { text-align: left; padding: 10px; border-bottom: 1px solid #e1e3e5; }
         th { color: #6d7175; font-weight: 600; }
@@ -48,6 +53,20 @@ DASHBOARD_HTML = """
             </div>
         </div>
 
+        {% if plan != 'pro' and sub_status == 'cancelled' %}
+        <div class="banner banner-warn">
+            <strong>Previous Subscription Cancelled:</strong> Your previous Fixer Pro subscription was automatically cancelled when the app was uninstalled. Your store is currently on the <strong>Free plan</strong>. You can resubscribe below at any time.
+        </div>
+        {% elif plan != 'pro' and sub_status == 'declined' %}
+        <div class="banner banner-info">
+            <strong>Subscription Charge Declined:</strong> Your Fixer Pro charge was not approved. You remain on the <strong>Free plan</strong> and can request approval again below whenever you are ready.
+        </div>
+        {% elif plan == 'pro' %}
+        <div class="banner banner-success">
+            <strong>Subscription Active:</strong> Your <strong>Fixer Pro ($4.99/month)</strong> plan is active with unlimited E.164 phone validation, duplicate detection &amp; auto-tagging.
+        </div>
+        {% endif %}
+
         <div class="stats-grid">
             <div class="stat-box">
                 <div class="stat-val" style="color:#108043;">{{ valid_count }}</div>
@@ -64,9 +83,11 @@ DASHBOARD_HTML = """
         </div>
 
         {% if plan != 'pro' %}
-        <div style="display:flex; justify-content:space-between; align-items:center; background:#fafbfb; padding:12px 16px; border-radius:6px; border:1px solid #e1e3e5;">
-            <span>Upgrade to <strong>Fixer Pro ($4.99/month)</strong> for unlimited E.164 phone validation, duplicate detection & auto-tagging.</span>
-            <a class="btn" href="/api/fixer/billing/upgrade?shop={{ store_id }}&fixer_id={{ fixer_id }}" target="_top">Upgrade Now ($4.99/mo)</a>
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; background:#fafbfb; padding:12px 16px; border-radius:6px; border:1px solid #e1e3e5;">
+            <span>Upgrade to <strong>Fixer Pro ($4.99/month)</strong> for unlimited E.164 phone validation, duplicate detection &amp; auto-tagging.</span>
+            <a class="btn" href="/api/fixer/billing/upgrade?shop={{ store_id }}&fixer_id={{ fixer_id }}" target="_top">
+                {{ 'Resubscribe to Pro ($4.99/mo)' if sub_status == 'cancelled' else 'Upgrade Now ($4.99/mo)' }}
+            </a>
         </div>
         {% endif %}
     </div>
@@ -131,6 +152,7 @@ DASHBOARD_HTML = """
 """
 
 def create_shopify_charge(shop, token, return_url):
+    is_test_charge = os.environ.get("SHOPIFY_BILLING_TEST", "true").lower() == "true"
     graphql_payload = {
         "query": """
         mutation AppSubscriptionCreate($name: String!, $lineItems: [AppSubscriptionLineItemInput!]!, $returnUrl: URL!, $test: Boolean) {
@@ -149,7 +171,7 @@ def create_shopify_charge(shop, token, return_url):
         "variables": {
             "name": "Fixer Pro Plan",
             "returnUrl": return_url,
-            "test": True,
+            "test": is_test_charge,
             "lineItems": [
                 {
                     "plan": {
@@ -195,11 +217,23 @@ def register_billing(bp):
         fixer_id = request.args.get("fixer_id", "")
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
-            cur.execute("SELECT fixer_id, plan, orders_count FROM stores WHERE store_id = ?", (shop,))
+            cur.execute(
+                "SELECT fixer_id, access_token, plan, orders_count, subscription_status FROM stores WHERE store_id = ?",
+                (shop,)
+            )
             row = cur.fetchone()
             if not row or (fixer_id and row[0] != fixer_id):
                 return jsonify({"error": "unauthorized_or_not_found"}), 403
+            db_fixer_id, access_token, plan, orders_used, sub_status = row
+            sub_status = sub_status or "none"
 
+        if access_token and len(access_token) > 10:
+            synced_plan, synced_status = sync_store_subscription(shop, access_token)
+            if synced_plan is not None:
+                plan, sub_status = synced_plan, synced_status
+
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
             cur.execute(
                 "SELECT order_id, raw_phone, clean_phone, status FROM order_logs WHERE store_id = ? ORDER BY id DESC LIMIT 15",
                 (shop,)
@@ -214,10 +248,11 @@ def register_billing(bp):
 
             return render_template_string(
                 DASHBOARD_HTML,
-                fixer_id=row[0],
+                fixer_id=db_fixer_id,
                 store_id=shop,
-                plan=row[1],
-                orders_used=row[2],
+                plan=plan,
+                sub_status=sub_status,
+                orders_used=orders_used,
                 free_limit=FREE_TIER_LIMIT,
                 valid_count=valid_count,
                 risked_count=risked_count,
@@ -242,17 +277,23 @@ def register_billing(bp):
 
         return_url = f"{APP_URL}/api/fixer/billing/confirm?shop={shop}&fixer_id={fixer_id}"
 
+        def _mark_pending_and_redirect(url):
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("UPDATE stores SET subscription_status = 'pending' WHERE store_id = ?", (shop,))
+                conn.commit()
+            return redirect(url)
+
         if access_token and len(access_token) > 10:
             try:
                 conf_url = create_shopify_charge(shop, access_token, return_url)
-                return redirect(conf_url)
+                return _mark_pending_and_redirect(conf_url)
             except urllib.error.HTTPError as e:
                 if e.code in (401, 403):
                     new_token = refresh_store_token(shop)
                     if new_token:
                         try:
                             conf_url = create_shopify_charge(shop, new_token, return_url)
-                            return redirect(conf_url)
+                            return _mark_pending_and_redirect(conf_url)
                         except Exception:
                             pass
                     if SHOPIFY_API_KEY and not (has_app_context() and current_app.config.get("TESTING")):
@@ -279,11 +320,11 @@ def register_billing(bp):
 
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
-            cur.execute("SELECT fixer_id FROM stores WHERE store_id = ?", (shop,))
+            cur.execute("SELECT fixer_id, access_token FROM stores WHERE store_id = ?", (shop,))
             row = cur.fetchone()
             if not row or row[0] != fixer_id:
                 return jsonify({"error": "unauthorized"}), 403
-            cur.execute("UPDATE stores SET plan = 'pro' WHERE store_id = ?", (shop,))
-            conn.commit()
+            access_token = row[1]
 
+        sync_store_subscription(shop, access_token, from_billing_confirm=True)
         return redirect(f"/api/fixer/dashboard?shop={shop}&fixer_id={fixer_id}")

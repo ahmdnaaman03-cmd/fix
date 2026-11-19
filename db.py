@@ -16,12 +16,20 @@ def init_db():
                 access_token TEXT,
                 refresh_token TEXT,
                 plan TEXT DEFAULT 'free',
+                subscription_status TEXT DEFAULT 'none',
+                subscription_id TEXT,
                 orders_count INTEGER DEFAULT 0
             )
         """)
-        for col in ("access_token", "refresh_token"):
+        migrations = (
+            ("access_token", "TEXT"),
+            ("refresh_token", "TEXT"),
+            ("subscription_status", "TEXT DEFAULT 'none'"),
+            ("subscription_id", "TEXT"),
+        )
+        for col, col_type in migrations:
             try:
-                conn.execute(f"ALTER TABLE stores ADD COLUMN {col} TEXT")
+                conn.execute(f"ALTER TABLE stores ADD COLUMN {col} {col_type}")
             except sqlite3.OperationalError:
                 pass
         conn.execute("""

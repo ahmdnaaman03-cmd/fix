@@ -118,7 +118,7 @@ def register_webhooks(bp):
                 fixer_id = f"fx_{uuid.uuid4().hex[:8]}"
                 access_token, plan, orders_count = None, "free", 0
                 cur.execute(
-                    "INSERT INTO stores (fixer_id, store_id, plan, orders_count) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO stores (fixer_id, store_id, plan, subscription_status, orders_count) VALUES (?, ?, ?, 'none', ?)",
                     (fixer_id, store_id, plan, orders_count)
                 )
             else:
@@ -189,6 +189,32 @@ def register_webhooks(bp):
             "orders_used": orders_count + 1,
             "free_limit": FREE_TIER_LIMIT
         }), 200
+
+    @bp.route("/webhooks/app_uninstalled", methods=["POST"])
+    def app_uninstalled_hook():
+        if not verify_shopify_hmac(request.get_data(), request.headers.get("X-Shopify-Hmac-Sha256")):
+            return jsonify({"error": "invalid_hmac"}), 401
+        data = request.get_json(silent=True) or {}
+        store_id = (
+            request.headers.get("X-Shopify-Shop-Domain")
+            or data.get("myshopify_domain")
+            or data.get("domain")
+            or data.get("shop_domain")
+        )
+        if store_id:
+            with sqlite3.connect(DB_PATH) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT plan, subscription_status FROM stores WHERE store_id = ?", (store_id,))
+                row = cur.fetchone()
+                if row:
+                    was_paid = (row[0] == "pro" or row[1] == "active")
+                    new_sub_status = "cancelled" if was_paid else "none"
+                    cur.execute(
+                        "UPDATE stores SET plan = 'free', subscription_status = ?, subscription_id = NULL, access_token = NULL, refresh_token = NULL WHERE store_id = ?",
+                        (new_sub_status, store_id)
+                    )
+                    conn.commit()
+        return jsonify({"status": "app_uninstalled_processed"}), 200
 
     @bp.route("/webhooks/customers_data_request", methods=["POST"])
     @bp.route("/webhooks/customers_redact", methods=["POST"])
