@@ -1,11 +1,14 @@
 import os
+import hmac
 import json
 import sqlite3
 import urllib.request
 import urllib.error
 from flask import request, redirect, jsonify, render_template_string, has_app_context, current_app
 from db import DB_PATH, FREE_TIER_LIMIT, APP_URL, SHOPIFY_API_KEY
+from utils import verify_oauth_hmac
 from oauth import refresh_store_token, sync_store_subscription
+from security import is_valid_shop, generate_csrf_token, verify_csrf_token, verify_shopify_jwt
 
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -33,7 +36,7 @@ DASHBOARD_HTML = """
         .badge-valid { background: #e3f1df; color: #108043; }
         .badge-dup { background: #fff5ea; color: #b98900; }
         .badge-invalid { background: #fbeae5; color: #d82c0d; }
-        .btn { background: #008060; color: #fff; text-decoration: none; padding: 10px 16px; border-radius: 4px; font-weight: 600; display: inline-block; white-space: nowrap; }
+        .btn { background: #008060; color: #fff; text-decoration: none; padding: 10px 16px; border-radius: 4px; font-weight: 600; display: inline-block; white-space: nowrap; border: none; cursor: pointer; font-size: 14px; }
         table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
         th, td { text-align: left; padding: 10px; border-bottom: 1px solid #e1e3e5; }
         th { color: #6d7175; font-weight: 600; }
@@ -85,9 +88,14 @@ DASHBOARD_HTML = """
         {% if plan != 'pro' %}
         <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; background:#fafbfb; padding:12px 16px; border-radius:6px; border:1px solid #e1e3e5;">
             <span>Upgrade to <strong>Fixer Pro ($4.99/month)</strong> for unlimited E.164 phone validation, duplicate detection &amp; auto-tagging.</span>
-            <a class="btn" href="/api/fixer/billing/upgrade?shop={{ store_id }}&fixer_id={{ fixer_id }}" target="_top">
-                {{ 'Resubscribe to Pro ($4.99/mo)' if sub_status == 'cancelled' else 'Upgrade Now ($4.99/mo)' }}
-            </a>
+            <form method="POST" action="/api/fixer/billing/upgrade" target="_top" style="margin:0;">
+                <input type="hidden" name="shop" value="{{ store_id }}">
+                <input type="hidden" name="fixer_id" value="{{ fixer_id }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button type="submit" class="btn">
+                    {{ 'Resubscribe to Pro ($4.99/mo)' if sub_status == 'cancelled' else 'Upgrade Now ($4.99/mo)' }}
+                </button>
+            </form>
         </div>
         {% endif %}
     </div>
@@ -132,8 +140,9 @@ DASHBOARD_HTML = """
         document.addEventListener("DOMContentLoaded", async function () {
             if (window.shopify && typeof window.shopify.idToken === "function") {
                 try {
+                    const shop = {{ store_id | tojson }};
                     const token = await window.shopify.idToken();
-                    await fetch("/api/fixer/session-ping?shop={{ store_id }}", {
+                    await fetch(`/api/fixer/session-ping?shop=${encodeURIComponent(shop)}`, {
                         method: "POST",
                         headers: {
                             "Authorization": "Bearer " + token,
@@ -204,17 +213,38 @@ def create_shopify_charge(shop, token, return_url):
         raise ValueError("Missing confirmationUrl from GraphQL appSubscriptionCreate")
 
 def register_billing(bp):
+    @bp.after_request
+    def add_security_headers(response):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        shop = request.args.get("shop", "")
+        if is_valid_shop(shop):
+            response.headers["Content-Security-Policy"] = (
+                f"frame-ancestors https://{shop} https://admin.shopify.com; "
+                "object-src 'none'; base-uri 'self';"
+            )
+        return response
+
     @bp.route("/session-ping", methods=["POST"])
     def session_ping():
+        shop = request.args.get("shop", "")
+        if shop and not is_valid_shop(shop):
+            return jsonify({"error": "invalid_shop_domain"}), 400
         auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            return jsonify({"status": "session_verified"}), 200
-        return jsonify({"error": "missing_session_token"}), 401
+        if not auth_header.startswith("Bearer "):
+            return jsonify({"error": "missing_session_token"}), 401
+        token = auth_header[7:].strip()
+        payload = verify_shopify_jwt(token, expected_shop=shop or None)
+        if not payload:
+            return jsonify({"error": "invalid_session_token"}), 401
+        return jsonify({"status": "session_verified"}), 200
 
     @bp.route("/dashboard", methods=["GET"])
     def merchant_dashboard():
         shop = request.args.get("shop", "")
         fixer_id = request.args.get("fixer_id", "")
+        if not is_valid_shop(shop):
+            return jsonify({"error": "invalid_shop_domain"}), 400
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
             cur.execute(
@@ -222,9 +252,16 @@ def register_billing(bp):
                 (shop,)
             )
             row = cur.fetchone()
-            if not row or (fixer_id and row[0] != fixer_id):
+            if not row:
                 return jsonify({"error": "unauthorized_or_not_found"}), 403
             db_fixer_id, access_token, plan, orders_used, sub_status = row
+            has_valid_fixer_id = bool(fixer_id and hmac.compare_digest(db_fixer_id, fixer_id))
+            has_valid_shopify_hmac = bool(
+                request.args.get("hmac")
+                and verify_oauth_hmac(request.args.to_dict())
+            )
+            if not (has_valid_fixer_id or has_valid_shopify_hmac):
+                return jsonify({"error": "unauthorized_or_not_found"}), 403
             sub_status = sub_status or "none"
 
         if access_token and len(access_token) > 10:
@@ -250,6 +287,7 @@ def register_billing(bp):
                 DASHBOARD_HTML,
                 fixer_id=db_fixer_id,
                 store_id=shop,
+                csrf_token=generate_csrf_token(shop, db_fixer_id),
                 plan=plan,
                 sub_status=sub_status,
                 orders_used=orders_used,
@@ -262,16 +300,32 @@ def register_billing(bp):
 
     @bp.route("/billing/upgrade", methods=["GET", "POST"])
     def request_upgrade():
-        shop = request.args.get("shop") or (request.get_json(silent=True) or {}).get("shop")
-        fixer_id = request.args.get("fixer_id") or request.headers.get("X-Fixer-Id")
+        body = request.get_json(silent=True) or {}
+        shop = request.form.get("shop") or request.args.get("shop") or body.get("shop")
+        fixer_id = (
+            request.form.get("fixer_id")
+            or request.args.get("fixer_id")
+            or request.headers.get("X-Fixer-Id")
+            or body.get("fixer_id")
+        )
         if not shop or not fixer_id:
             return jsonify({"error": "missing_parameters"}), 400
+        if not is_valid_shop(shop):
+            return jsonify({"error": "invalid_shop_domain"}), 400
+        if request.method == "POST":
+            csrf_token = (
+                request.form.get("csrf_token")
+                or request.headers.get("X-CSRF-Token")
+                or body.get("csrf_token")
+            )
+            if not verify_csrf_token(shop, fixer_id, csrf_token):
+                return jsonify({"error": "invalid_csrf_token"}), 403
 
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
             cur.execute("SELECT fixer_id, access_token FROM stores WHERE store_id = ?", (shop,))
             row = cur.fetchone()
-            if not row or row[0] != fixer_id:
+            if not row or not hmac.compare_digest(row[0], fixer_id):
                 return jsonify({"error": "unauthorized_store_access"}), 403
             access_token = row[1]
 
@@ -317,12 +371,14 @@ def register_billing(bp):
         fixer_id = request.args.get("fixer_id")
         if not shop or not fixer_id:
             return jsonify({"error": "missing_parameters"}), 400
+        if not is_valid_shop(shop):
+            return jsonify({"error": "invalid_shop_domain"}), 400
 
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
             cur.execute("SELECT fixer_id, access_token FROM stores WHERE store_id = ?", (shop,))
             row = cur.fetchone()
-            if not row or row[0] != fixer_id:
+            if not row or not hmac.compare_digest(row[0], fixer_id):
                 return jsonify({"error": "unauthorized"}), 403
             access_token = row[1]
 

@@ -1,12 +1,14 @@
+import hmac
 import json
 import uuid
 import sqlite3
 import urllib.parse
 import urllib.request
 import urllib.error
-from flask import request, redirect, jsonify
+from flask import request, redirect, jsonify, make_response, has_app_context, current_app
 from db import DB_PATH, SHOPIFY_API_KEY, SHOPIFY_API_SECRET, APP_URL
 from utils import verify_oauth_hmac
+from security import is_valid_shop, generate_oauth_state
 
 def refresh_store_token(shop):
     if not SHOPIFY_API_KEY or not SHOPIFY_API_SECRET:
@@ -178,6 +180,8 @@ def register_oauth(bp):
         next_action = request.args.get("next", "")
         if not shop:
             return jsonify({"error": "missing_shop_parameter"}), 400
+        if not is_valid_shop(shop):
+            return jsonify({"error": "invalid_shop_domain"}), 400
         if not SHOPIFY_API_KEY:
             return jsonify({
                 "status": "oauth_ready",
@@ -187,13 +191,24 @@ def register_oauth(bp):
         scopes = "read_orders,write_orders,read_customers"
         redirect_uri = f"{APP_URL}/api/fixer/auth/callback"
         state_prefix = "upgrade_" if next_action == "upgrade" else ""
+        state = generate_oauth_state(state_prefix)
         params = urllib.parse.urlencode({
             "client_id": SHOPIFY_API_KEY,
             "scope": scopes,
             "redirect_uri": redirect_uri,
-            "state": f"{state_prefix}{uuid.uuid4().hex[:10]}"
+            "state": state
         })
-        return redirect(f"https://{shop}/admin/oauth/authorize?{params}")
+        resp = make_response(redirect(f"https://{shop}/admin/oauth/authorize?{params}"))
+        is_testing = has_app_context() and current_app.config.get("TESTING")
+        resp.set_cookie(
+            "fixer_oauth_state",
+            state,
+            httponly=True,
+            secure=not is_testing,
+            samesite="Lax",
+            max_age=600
+        )
+        return resp
 
     @bp.route("/callback", methods=["GET"])
     @bp.route("/auth/callback", methods=["GET"])
@@ -204,6 +219,13 @@ def register_oauth(bp):
         state = params.get("state", "")
         if not shop or not code:
             return jsonify({"error": "missing_oauth_parameters"}), 400
+        if not is_valid_shop(shop):
+            return jsonify({"error": "invalid_shop_domain"}), 400
+
+        cookie_state = request.cookies.get("fixer_oauth_state", "")
+        if not state or not cookie_state or not hmac.compare_digest(cookie_state, state):
+            return jsonify({"error": "invalid_oauth_state"}), 403
+
         if not verify_oauth_hmac(params):
             return jsonify({"error": "invalid_oauth_hmac"}), 401
 
@@ -252,6 +274,11 @@ def register_oauth(bp):
             register_webhook_graphql(shop, access_token, "APP_UNINSTALLED", "/api/fixer/webhooks/app_uninstalled")
             sync_store_subscription(shop, access_token)
 
-        if state.startswith("upgrade_"):
-            return redirect(f"/api/fixer/billing/upgrade?shop={shop}&fixer_id={fixer_id}")
-        return redirect(f"/api/fixer/dashboard?shop={shop}&fixer_id={fixer_id}")
+        target = (
+            f"/api/fixer/billing/upgrade?shop={shop}&fixer_id={fixer_id}"
+            if state.startswith("upgrade_")
+            else f"/api/fixer/dashboard?shop={shop}&fixer_id={fixer_id}"
+        )
+        resp = make_response(redirect(target))
+        resp.delete_cookie("fixer_oauth_state")
+        return resp
