@@ -1,3 +1,5 @@
+import sys
+import time
 import hmac
 import json
 import uuid
@@ -136,41 +138,85 @@ def sync_store_subscription(shop, access_token=None, from_billing_confirm=False)
         return new_plan, new_status
 
 def register_webhook_graphql(shop, access_token, topic, callback_path):
-    graphql_payload = {
-        "query": """
-        mutation webhookSubscriptionCreate($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
-          webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
-            webhookSubscription {
-              id
-            }
-            userErrors {
-              field
-              message
-            }
-          }
+    target_url = f"{APP_URL}{callback_path}"
+    mutation = """
+    mutation webhookSubscriptionCreate($topic: WebhookSubscriptionTopic!,$webhookSubscription: WebhookSubscriptionInput!) {
+      webhookSubscriptionCreate(topic: $topic, webhookSubscription:$webhookSubscription) {
+        webhookSubscription {
+          id
         }
-        """,
-        "variables": {
-            "topic": topic,
-            "webhookSubscription": {
-                "callbackUrl": f"{APP_URL}{callback_path}",
-                "format": "JSON"
-            }
+        userErrors {
+          field
+          message
         }
+      }
     }
-    req = urllib.request.Request(
-        f"https://{shop}/admin/api/2026-01/graphql.json",
-        data=json.dumps(graphql_payload).encode("utf-8"),
-        headers={
-            "X-Shopify-Access-Token": access_token,
-            "Content-Type": "application/json"
-        },
-        method="POST"
-    )
-    try:
-        urllib.request.urlopen(req, timeout=10)
-    except Exception:
-        pass
+    """
+
+    def _send(token, url_field):
+        graphql_payload = {
+            "query": mutation,
+            "variables": {
+                "topic": topic,
+                "webhookSubscription": {
+                    url_field: target_url,
+                    "format": "JSON"
+                }
+            }
+        }
+        req = urllib.request.Request(
+            f"https://{shop}/admin/api/2026-01/graphql.json",
+            data=json.dumps(graphql_payload).encode("utf-8"),
+            headers={
+                "X-Shopify-Access-Token": token,
+                "Content-Type": "application/json"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    for url_field in ("uri", "callbackUrl"):
+        try:
+            res_data = _send(access_token, url_field)
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                new_token = refresh_store_token(shop)
+                if new_token:
+                    access_token = new_token
+                    try:
+                        res_data = _send(access_token, url_field)
+                    except Exception as inner_e:
+                        print(f"[Fixer] Webhook {topic} failed after refresh: {inner_e}", file=sys.stderr)
+                        return False
+                else:
+                    return False
+            else:
+                print(f"[Fixer] Webhook {topic} HTTP error: {e.code}", file=sys.stderr)
+                return False
+        except Exception as e:
+            print(f"[Fixer] Webhook {topic} error: {e}", file=sys.stderr)
+            return False
+
+        gql_errors = res_data.get("errors") or []
+        if gql_errors:
+            err_text = json.dumps(gql_errors)
+            if url_field == "uri" and "uri" in err_text:
+                continue
+            print(f"[Fixer] Webhook {topic} GraphQL errors: {err_text}", file=sys.stderr)
+            return False
+
+        sub_res = (res_data.get("data") or {}).get("webhookSubscriptionCreate") or {}
+        user_errors = sub_res.get("userErrors") or []
+        if sub_res.get("webhookSubscription"):
+            return True
+        if user_errors:
+            msg = json.dumps(user_errors)
+            if "already been taken" in msg.lower():
+                return True
+            print(f"[Fixer] Webhook {topic} userErrors: {msg}", file=sys.stderr)
+        return False
+    return False
 
 def register_oauth(bp):
     @bp.route("/install", methods=["GET"])
@@ -192,6 +238,16 @@ def register_oauth(bp):
         redirect_uri = f"{APP_URL}/api/fixer/auth/callback"
         state_prefix = "upgrade_" if next_action == "upgrade" else ""
         state = generate_oauth_state(state_prefix)
+
+        with sqlite3.connect(DB_PATH) as conn:
+            now = time.time()
+            conn.execute("DELETE FROM oauth_states WHERE created_at < ?", (now - 600,))
+            conn.execute(
+                "INSERT OR REPLACE INTO oauth_states (state, shop, created_at) VALUES (?, ?, ?)",
+                (state, shop, now)
+            )
+            conn.commit()
+
         params = urllib.parse.urlencode({
             "client_id": SHOPIFY_API_KEY,
             "scope": scopes,
@@ -223,8 +279,23 @@ def register_oauth(bp):
             return jsonify({"error": "invalid_shop_domain"}), 400
 
         cookie_state = request.cookies.get("fixer_oauth_state", "")
-        if not state or not cookie_state or not hmac.compare_digest(cookie_state, state):
+        if not state:
             return jsonify({"error": "invalid_oauth_state"}), 403
+        if cookie_state and not hmac.compare_digest(cookie_state, state):
+            return jsonify({"error": "invalid_oauth_state"}), 403
+
+        with sqlite3.connect(DB_PATH) as conn:
+            now = time.time()
+            conn.execute("DELETE FROM oauth_states WHERE created_at < ?", (now - 600,))
+            state_row = conn.execute(
+                "SELECT state FROM oauth_states WHERE state = ? AND shop = ?",
+                (state, shop)
+            ).fetchone()
+            if not state_row:
+                conn.commit()
+                return jsonify({"error": "invalid_oauth_state"}), 403
+            conn.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+            conn.commit()
 
         if not verify_oauth_hmac(params):
             return jsonify({"error": "invalid_oauth_hmac"}), 401

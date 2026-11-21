@@ -19,7 +19,17 @@ COUNTRY_CODES = {
     "QA": "+974",
     "BH": "+973",
     "OM": "+968",
-    "JO": "+962"
+    "JO": "+962",
+    "MA": "+212",
+    "TN": "+216",
+    "LB": "+961",
+    "IQ": "+964",
+    "US": "+1",
+    "CA": "+1",
+    "GB": "+44",
+    "AU": "+61",
+    "DE": "+49",
+    "FR": "+33"
 }
 
 def verify_shopify_hmac(raw_body, hmac_header):

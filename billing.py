@@ -1,4 +1,5 @@
 import os
+import sys
 import hmac
 import json
 import sqlite3
@@ -7,7 +8,8 @@ import urllib.error
 from flask import request, redirect, jsonify, render_template_string, has_app_context, current_app
 from db import DB_PATH, FREE_TIER_LIMIT, APP_URL, SHOPIFY_API_KEY
 from utils import verify_oauth_hmac
-from oauth import refresh_store_token, sync_store_subscription
+from oauth import refresh_store_token, sync_store_subscription, fetch_active_subscriptions_graphql
+from webhooks import sync_recent_orders_graphql
 from security import is_valid_shop, generate_csrf_token, verify_csrf_token, verify_shopify_jwt
 
 DASHBOARD_HTML = """
@@ -30,13 +32,21 @@ DASHBOARD_HTML = """
         .stat-box { background: #fafbfb; border: 1px solid #e1e3e5; border-radius: 6px; padding: 12px; text-align: center; }
         .stat-val { font-size: 20px; font-weight: 700; color: #202223; }
         .stat-lbl { font-size: 12px; color: #6d7175; margin-top: 4px; }
-        .badge { padding: 4px 10px; border-radius: 12px; font-size: 13px; font-weight: 600; }
+        .plans-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-top: 12px; }
+        .plan-box { background: #fafbfb; border: 1px solid #e1e3e5; border-radius: 8px; padding: 16px; display: flex; flex-direction: column; justify-content: space-between; }
+        .plan-box-active { border: 2px solid #008060; background: #f4faf7; }
+        .plan-title { font-size: 16px; font-weight: 700; margin: 0 0 4px; }
+        .plan-price { font-size: 22px; font-weight: 700; margin: 0 0 8px; color: #202223; }
+        .plan-features { margin: 0 0 14px; padding-left: 18px; font-size: 13px; color: #4a4f54; line-height: 1.6; }
+        .badge { padding: 4px 10px; border-radius: 12px; font-size: 13px; font-weight: 600; display: inline-block; }
         .badge-free { background: #e3f1df; color: #108043; }
         .badge-pro { background: #e0f5f5; color: #006fbb; }
         .badge-valid { background: #e3f1df; color: #108043; }
         .badge-dup { background: #fff5ea; color: #b98900; }
         .badge-invalid { background: #fbeae5; color: #d82c0d; }
         .btn { background: #008060; color: #fff; text-decoration: none; padding: 10px 16px; border-radius: 4px; font-weight: 600; display: inline-block; white-space: nowrap; border: none; cursor: pointer; font-size: 14px; }
+        .btn-secondary { background: #fff; color: #202223; border: 1px solid #c9cccf; }
+        .btn-danger { background: #fff; color: #d82c0d; border: 1px solid #f4c7c3; }
         table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 14px; }
         th, td { text-align: left; padding: 10px; border-bottom: 1px solid #e1e3e5; }
         th { color: #6d7175; font-weight: 600; }
@@ -59,6 +69,10 @@ DASHBOARD_HTML = """
         {% if plan != 'pro' and sub_status == 'cancelled' %}
         <div class="banner banner-warn">
             <strong>Previous Subscription Cancelled:</strong> Your previous Fixer Pro subscription was automatically cancelled when the app was uninstalled. Your store is currently on the <strong>Free plan</strong>. You can resubscribe below at any time.
+        </div>
+        {% elif plan != 'pro' and sub_status == 'downgraded' %}
+        <div class="banner banner-success">
+            <strong>Plan Downgraded to Free:</strong> Your Fixer Pro subscription has been cancelled in Shopify Billing. Your store is now on the <strong>Free plan</strong> (up to {{ free_limit }} orders/month), and you can upgrade again below at any time.
         </div>
         {% elif plan != 'pro' and sub_status == 'declined' %}
         <div class="banner banner-info">
@@ -85,27 +99,75 @@ DASHBOARD_HTML = """
             </div>
         </div>
 
-        {% if plan != 'pro' %}
-        <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; background:#fafbfb; padding:12px 16px; border-radius:6px; border:1px solid #e1e3e5;">
-            <span>Upgrade to <strong>Fixer Pro ($4.99/month)</strong> for unlimited E.164 phone validation, duplicate detection &amp; auto-tagging.</span>
-            <form method="POST" action="/api/fixer/billing/upgrade" target="_top" style="margin:0;">
-                <input type="hidden" name="shop" value="{{ store_id }}">
-                <input type="hidden" name="fixer_id" value="{{ fixer_id }}">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                <button type="submit" class="btn">
-                    {{ 'Resubscribe to Pro ($4.99/mo)' if sub_status == 'cancelled' else 'Upgrade Now ($4.99/mo)' }}
-                </button>
-            </form>
+        <h3 style="margin:16px 0 4px;">Pricing &amp; Billing Plans</h3>
+        <p style="margin:0 0 8px; font-size:13px; color:#6d7175;">Upgrade or downgrade your plan at any time. Changes sync directly with Shopify Billing.</p>
+        <div class="plans-grid">
+            <div class="plan-box {{ 'plan-box-active' if plan != 'pro' else '' }}">
+                <div>
+                    <div class="plan-title">Free Plan</div>
+                    <div class="plan-price">$0 <span style="font-size:13px; font-weight:400; color:#6d7175;">/ month</span></div>
+                    <ul class="plan-features">
+                        <li>Up to {{ free_limit }} validated orders / month</li>
+                        <li>Automatic E.164 phone formatting</li>
+                        <li>Duplicate detection &amp; Shopify order auto-tagging</li>
+                    </ul>
+                </div>
+                <div>
+                    {% if plan == 'pro' %}
+                    <form method="POST" action="/api/fixer/billing/downgrade" style="margin:0;">
+                        <input type="hidden" name="shop" value="{{ store_id }}">
+                        <input type="hidden" name="fixer_id" value="{{ fixer_id }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <button type="submit" class="btn btn-danger">Downgrade to Free</button>
+                    </form>
+                    {% else %}
+                    <span class="badge badge-free">Current Plan</span>
+                    {% endif %}
+                </div>
+            </div>
+
+            <div class="plan-box {{ 'plan-box-active' if plan == 'pro' else '' }}">
+                <div>
+                    <div class="plan-title">Fixer Pro</div>
+                    <div class="plan-price">$4.99 <span style="font-size:13px; font-weight:400; color:#6d7175;">/ month</span></div>
+                    <ul class="plan-features">
+                        <li>Unlimited validated orders / month</li>
+                        <li>Automatic E.164 phone formatting</li>
+                        <li>Duplicate detection &amp; Shopify order auto-tagging</li>
+                    </ul>
+                </div>
+                <div>
+                    {% if plan == 'pro' %}
+                    <span class="badge badge-pro">Current Plan</span>
+                    {% else %}
+                    <form method="POST" action="/api/fixer/billing/upgrade" target="_top" style="margin:0;">
+                        <input type="hidden" name="shop" value="{{ store_id }}">
+                        <input type="hidden" name="fixer_id" value="{{ fixer_id }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <button type="submit" class="btn">
+                            {{ 'Resubscribe to Pro ($4.99/mo)' if sub_status == 'cancelled' else 'Upgrade Now ($4.99/mo)' }}
+                        </button>
+                    </form>
+                    {% endif %}
+                </div>
+            </div>
         </div>
-        {% endif %}
     </div>
 
     <div class="card">
-        <h3 style="margin-top:0;">Recent Processed Orders (Live ROI Log)</h3>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+            <h3 style="margin:0;">Recent Processed Orders (Live ROI Log)</h3>
+            <form method="POST" action="/api/fixer/orders/sync" style="margin:0;">
+                <input type="hidden" name="shop" value="{{ store_id }}">
+                <input type="hidden" name="fixer_id" value="{{ fixer_id }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button type="submit" class="btn btn-secondary" style="padding:6px 12px; font-size:13px;">Sync Orders Now</button>
+            </form>
+        </div>
         <table>
             <thead>
                 <tr>
-                    <th>Order ID</th>
+                    <th>Order</th>
                     <th>Raw Input Phone</th>
                     <th>Formatted E.164 Phone</th>
                     <th>Status</th>
@@ -114,13 +176,13 @@ DASHBOARD_HTML = """
             <tbody>
                 {% for log in logs %}
                 <tr>
-                    <td>#{{ log[0] }}</td>
-                    <td>{{ log[1] or 'Missing' }}</td>
-                    <td><strong>{{ log[2] or '-' }}</strong></td>
+                    <td>{{ log[1] if log[1] else ('#' ~ log[0]) }}</td>
+                    <td>{{ log[2] or 'Missing' }}</td>
+                    <td><strong>{{ log[3] or '-' }}</strong></td>
                     <td>
-                        {% if log[3] == 'valid' %}
+                        {% if log[4] == 'valid' %}
                         <span class="badge badge-valid">Fixer: E.164 Verified</span>
-                        {% elif log[3] == 'valid_duplicate' %}
+                        {% elif log[4] == 'valid_duplicate' %}
                         <span class="badge badge-dup">Fixer: Duplicate Order</span>
                         {% else %}
                         <span class="badge badge-invalid">Fixer: Invalid Phone</span>
@@ -212,6 +274,44 @@ def create_shopify_charge(shop, token, return_url):
             return sub_data["confirmationUrl"]
         raise ValueError("Missing confirmationUrl from GraphQL appSubscriptionCreate")
 
+def cancel_shopify_subscription(shop, token, subscription_id):
+    graphql_payload = {
+        "query": """
+        mutation AppSubscriptionCancel($id: ID!) {
+          appSubscriptionCancel(id: $id) {
+            appSubscription {
+              id
+              status
+            }
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+        """,
+        "variables": {
+            "id": subscription_id
+        }
+    }
+    req = urllib.request.Request(
+        f"https://{shop}/admin/api/2026-01/graphql.json",
+        data=json.dumps(graphql_payload).encode("utf-8"),
+        headers={
+            "X-Shopify-Access-Token": token,
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        res_data = json.loads(resp.read().decode("utf-8"))
+        cancel_data = (res_data.get("data") or {}).get("appSubscriptionCancel") or {}
+        user_errors = cancel_data.get("userErrors") or []
+        if user_errors:
+            print(f"[Fixer] appSubscriptionCancel userErrors: {user_errors}", file=sys.stderr)
+            return False
+        return bool(cancel_data.get("appSubscription"))
+
 def register_billing(bp):
     @bp.after_request
     def add_security_headers(response):
@@ -268,11 +368,17 @@ def register_billing(bp):
             synced_plan, synced_status = sync_store_subscription(shop, access_token)
             if synced_plan is not None:
                 plan, sub_status = synced_plan, synced_status
+            sync_recent_orders_graphql(shop)
 
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
+            cur.execute("SELECT orders_count FROM stores WHERE store_id = ?", (shop,))
+            fresh_count = cur.fetchone()
+            if fresh_count is not None:
+                orders_used = fresh_count[0]
+
             cur.execute(
-                "SELECT order_id, raw_phone, clean_phone, status FROM order_logs WHERE store_id = ? ORDER BY id DESC LIMIT 15",
+                "SELECT order_id, order_name, raw_phone, clean_phone, status FROM order_logs WHERE store_id = ? ORDER BY id DESC LIMIT 15",
                 (shop,)
             )
             logs = cur.fetchall()
@@ -297,6 +403,36 @@ def register_billing(bp):
                 api_key=SHOPIFY_API_KEY or "eaab80121282dc9f5cc31d491bd073f1",
                 logs=logs
             ), 200
+
+    @bp.route("/orders/sync", methods=["POST"])
+    def manual_sync_orders():
+        body = request.get_json(silent=True) or {}
+        shop = request.form.get("shop") or request.args.get("shop") or body.get("shop")
+        fixer_id = (
+            request.form.get("fixer_id")
+            or request.args.get("fixer_id")
+            or request.headers.get("X-Fixer-Id")
+            or body.get("fixer_id")
+        )
+        csrf_token = (
+            request.form.get("csrf_token")
+            or request.headers.get("X-CSRF-Token")
+            or body.get("csrf_token")
+        )
+        if not shop or not fixer_id:
+            return jsonify({"error": "missing_parameters"}), 400
+        if not is_valid_shop(shop):
+            return jsonify({"error": "invalid_shop_domain"}), 400
+        if not verify_csrf_token(shop, fixer_id, csrf_token):
+            return jsonify({"error": "invalid_csrf_token"}), 403
+
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute("SELECT fixer_id FROM stores WHERE store_id = ?", (shop,)).fetchone()
+            if not row or not hmac.compare_digest(row[0], fixer_id):
+                return jsonify({"error": "unauthorized_store_access"}), 403
+
+        sync_recent_orders_graphql(shop)
+        return redirect(f"/api/fixer/dashboard?shop={shop}&fixer_id={fixer_id}")
 
     @bp.route("/billing/upgrade", methods=["GET", "POST"])
     def request_upgrade():
@@ -364,6 +500,85 @@ def register_billing(bp):
             "price_usd": 4.99,
             "confirmation_url": return_url
         }), 200
+
+    @bp.route("/billing/downgrade", methods=["POST"])
+    def request_downgrade():
+        body = request.get_json(silent=True) or {}
+        shop = request.form.get("shop") or request.args.get("shop") or body.get("shop")
+        fixer_id = (
+            request.form.get("fixer_id")
+            or request.args.get("fixer_id")
+            or request.headers.get("X-Fixer-Id")
+            or body.get("fixer_id")
+        )
+        csrf_token = (
+            request.form.get("csrf_token")
+            or request.headers.get("X-CSRF-Token")
+            or body.get("csrf_token")
+        )
+        if not shop or not fixer_id:
+            return jsonify({"error": "missing_parameters"}), 400
+        if not is_valid_shop(shop):
+            return jsonify({"error": "invalid_shop_domain"}), 400
+        if not verify_csrf_token(shop, fixer_id, csrf_token):
+            return jsonify({"error": "invalid_csrf_token"}), 403
+
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT fixer_id, access_token, subscription_id FROM stores WHERE store_id = ?",
+                (shop,)
+            )
+            row = cur.fetchone()
+            if not row or not hmac.compare_digest(row[0], fixer_id):
+                return jsonify({"error": "unauthorized_store_access"}), 403
+            access_token, stored_sub_id = row[1], row[2]
+
+        if access_token and len(access_token) > 10:
+            active_token = access_token
+            sub_ids = []
+            try:
+                subs = fetch_active_subscriptions_graphql(shop, active_token)
+                sub_ids = [s.get("id") for s in (subs or []) if (s.get("status") or "").upper() == "ACTIVE" and s.get("id")]
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    new_token = refresh_store_token(shop)
+                    if new_token:
+                        active_token = new_token
+                        try:
+                            subs = fetch_active_subscriptions_graphql(shop, active_token)
+                            sub_ids = [s.get("id") for s in (subs or []) if (s.get("status") or "").upper() == "ACTIVE" and s.get("id")]
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            if not sub_ids and stored_sub_id:
+                sub_ids = [stored_sub_id]
+
+            for sid in sub_ids:
+                try:
+                    cancel_shopify_subscription(shop, active_token, sid)
+                except urllib.error.HTTPError as e:
+                    if e.code in (401, 403):
+                        new_token = refresh_store_token(shop)
+                        if new_token:
+                            active_token = new_token
+                            try:
+                                cancel_shopify_subscription(shop, active_token, sid)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    print(f"[Fixer] Downgrade cancel error: {e}", file=sys.stderr)
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE stores SET plan = 'free', subscription_status = 'downgraded', subscription_id = NULL WHERE store_id = ?",
+                (shop,)
+            )
+            conn.commit()
+
+        return redirect(f"/api/fixer/dashboard?shop={shop}&fixer_id={fixer_id}")
 
     @bp.route("/billing/confirm", methods=["GET"])
     def confirm_upgrade():

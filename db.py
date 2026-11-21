@@ -38,8 +38,20 @@ def init_db():
                 fixer_id TEXT,
                 store_id TEXT,
                 order_id TEXT,
+                order_name TEXT,
                 raw_phone TEXT,
                 clean_phone TEXT,
                 status TEXT
+            )
+        """)
+        try:
+            conn.execute("ALTER TABLE order_logs ADD COLUMN order_name TEXT")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS oauth_states (
+                state TEXT PRIMARY KEY,
+                shop TEXT NOT NULL,
+                created_at REAL NOT NULL
             )
         """)
